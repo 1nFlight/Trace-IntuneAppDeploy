@@ -58,12 +58,11 @@
     .\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace
 
 .EXAMPLE
-    # Download-then-run (irm | iex does NOT work - top-level [CmdletBinding()]
-    # is not legal inside an in-memory script block)
-    $u = 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'
-    $p = Join-Path $env:TEMP 'Trace-IntuneAppDeploy.ps1'
-    Invoke-RestMethod $u -OutFile $p
-    & $p   # add parameters as needed
+    # One-liner (irm | iex does NOT work - top-level [CmdletBinding()]
+    # is not legal at the caller's script scope where iex evaluates).
+    # Use [scriptblock]::Create so the text is parsed as a script block,
+    # which honors param() / [CmdletBinding()] like a .ps1 file does.
+    & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'))) -MaxMinutes 30
 
 .NOTES
     Requires administrator elevation.
