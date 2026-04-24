@@ -58,8 +58,12 @@
     .\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace
 
 .EXAMPLE
-    # One-liner
-    irm https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1 | iex
+    # Download-then-run (irm | iex does NOT work - top-level [CmdletBinding()]
+    # is not legal inside an in-memory script block)
+    $u = 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'
+    $p = Join-Path $env:TEMP 'Trace-IntuneAppDeploy.ps1'
+    Invoke-RestMethod $u -OutFile $p
+    & $p   # add parameters as needed
 
 .NOTES
     Requires administrator elevation.

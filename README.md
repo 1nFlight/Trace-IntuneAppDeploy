@@ -28,11 +28,16 @@ Where the Microsoft OneDataCollector (ODC) and similar tools capture an *after-t
 
 ## Install / run
 
-### One-liner (recommended)
+### One-liner (recommended) — download then run
 
 ```powershell
-irm https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1 | iex
+$url = 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'
+$dst = Join-Path $env:TEMP 'Trace-IntuneAppDeploy.ps1'
+Invoke-RestMethod $url -OutFile $dst
+& $dst                               # add params here, e.g.  -MaxMinutes 30  -NoNetworkTrace
 ```
+
+> **Why not `irm … | iex`?** `iex` evaluates the script as an *in-memory script block*, which doesn't accept top-level `[CmdletBinding()]` / `param()`. Use the download-then-run pattern above (or clone the repo) so PowerShell parses the file as a script.
 
 ### Local
 
