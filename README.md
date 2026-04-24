@@ -31,14 +31,14 @@ Where the Microsoft OneDataCollector (ODC) and similar tools capture an *after-t
 ### One-liner (recommended)
 
 ```powershell
-# No params
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1')))
-
-# With params
-& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'))) -MaxMinutes 30 -NoNetworkTrace
+irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1' | iex
 ```
 
-> **Why not `irm … | iex`?** `iex` runs its input at the caller's script scope, where top-level `[CmdletBinding()]` / `param()` are not legal statements. `[scriptblock]::Create($text)` parses the text as a fresh script block — which honors `param()` and `[CmdletBinding()]` exactly like a `.ps1` file does. `&` then invokes it and forwards parameters.
+With parameters — use `[scriptblock]::Create` so `param()` accepts them:
+
+```powershell
+& ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'))) -MaxMinutes 30 -NoNetworkTrace
+```
 
 ### Local
 
@@ -135,7 +135,7 @@ The script ships **UTF-8 BOM + CRLF** specifically so PS 5.1 doesn't mis-decode 
 
 ## Version
 
-`v1.2.3` (2026-04-24). See the `Changelog` block at the top of the script for the full history.
+`v1.2.4` (2026-04-24). See the `Changelog` block at the top of the script for the full history.
 
 ---
 

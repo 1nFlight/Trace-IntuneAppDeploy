@@ -1,4 +1,4 @@
-﻿#Requires -Version 5.1
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Live trace collector for Intune Company Portal Win32 / MSIX / LOB app deployments.
@@ -58,10 +58,11 @@
     .\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace
 
 .EXAMPLE
-    # One-liner (irm | iex does NOT work - top-level [CmdletBinding()]
-    # is not legal at the caller's script scope where iex evaluates).
-    # Use [scriptblock]::Create so the text is parsed as a script block,
-    # which honors param() / [CmdletBinding()] like a .ps1 file does.
+    # One-liner (no params)
+    irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1' | iex
+
+.EXAMPLE
+    # One-liner with params (use [scriptblock]::Create so param() accepts them)
     & ([scriptblock]::Create((irm 'https://raw.githubusercontent.com/1nFlight/Trace-IntuneAppDeploy/main/Trace-IntuneAppDeploy.ps1'))) -MaxMinutes 30
 
 .NOTES
@@ -71,6 +72,27 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.2.4  2026-04-24  Remote-execution fix.
+                           v1.0.1-1.2.3 saved the file as UTF-8 *with* BOM,
+                           originally to prevent PS 5.1 ANSI codepage decoding
+                           the embedded em-dashes as mojibake. The dashes were
+                           later replaced with ASCII so the BOM was no longer
+                           needed - and it was actively breaking remote
+                           execution: irm preserves the BOM as a literal U+FEFF
+                           character at position 0 of the returned string,
+                           which makes PowerShell's parser stop recognizing
+                           the leading '#Requires -Version 5.1' as a directive
+                           and instead parse it as a command call. Once any
+                           command has been parsed, top-level param() is no
+                           longer legal, so the parser then errors on
+                           [CmdletBinding()] / param() with 'Unexpected
+                           attribute' - even though the .ps1 file itself runs
+                           fine when invoked from disk (the script-loader path
+                           strips the BOM).
+                           Fix: re-saved as UTF-8 *without* BOM. Now both:
+                             irm <url> | iex
+                             & ([scriptblock]::Create((irm <url>))) -Param Val
+                           work as expected.
         1.2.3  2026-04-24  DO log fidelity fix.
                            v1.2.0-1.2.2 filtered Get-DeliveryOptimizationLog by
                            comparing entry.TimeCreated against local-time trace
@@ -216,7 +238,7 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.2.3'
+$APP_VERSION = '1.2.4'
 $APP_BUILD   = '2026-04-24'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
