@@ -68,6 +68,23 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.2.3  2026-04-24  DO log fidelity fix.
+                           v1.2.0-1.2.2 filtered Get-DeliveryOptimizationLog by
+                           comparing entry.TimeCreated against local-time trace
+                           bounds. DO writes TimeCreated as UTC but reports it
+                           with DateTimeKind=Unspecified, so on any non-UTC
+                           host the comparison silently dropped every entry
+                           and the captured file contained only the placeholder
+                           'No DO log entries in trace window.' (39 bytes,
+                           vs ~7 MB from the ODC collector on the same host).
+                           Fixes:
+                             - Trace bounds now converted to UTC before compare.
+                             - Entry timestamps coerced to UTC (treats Unspecified
+                               as UTC, matching DO log convention).
+                             - Window pad widened from 30s to 120s.
+                             - Empty-result fallback: dump the full DO log
+                               (matches ODC over-collect behavior; trace window
+                               is documented in _Summary.txt for correlation).
         1.2.2  2026-04-22  ODC-compatible directory structure (pairs with
                            Collect-IntuneLogs v1.2.0). Store Analyzer v2.3.4
                            and Win32 Analyzer v4.5.9 expect every artifact
@@ -196,8 +213,8 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.2.2'
-$APP_BUILD   = '2026-04-22'
+$APP_VERSION = '1.2.3'
+$APP_BUILD   = '2026-04-24'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:Computer  = $env:COMPUTERNAME
@@ -1146,11 +1163,32 @@ Invoke-Safe 'Delivery Optimization log (trace window)' {
     # %COMPUTERNAME%_Get-DeliveryOptimizationLog.txt under Intune\Commands\General
     $doOut = Get-CmdOutPath -Dir $cmdDir -OutputFileName 'Get-DeliveryOptimizationLog'
     try {
-        # Get-DeliveryOptimizationLog emits objects with a TimeCreated property;
-        # filter to window, then format as the same text format the full cmdlet produces.
-        $doEntries = Get-DeliveryOptimizationLog -ErrorAction Stop |
-                     Where-Object { $_.TimeCreated -ge $script:TraceStartedAt.AddSeconds(-30) -and
-                                    $_.TimeCreated -le $script:TraceEndedAt.AddSeconds(30) }
+        # Get-DeliveryOptimizationLog emits objects with a TimeCreated property
+        # whose values are stored as UTC but reported with DateTimeKind=Unspecified -
+        # so the same comparison must happen against UTC trace bounds. v1.2.2 used
+        # local-time bounds, which silently dropped every entry on non-UTC hosts.
+        # v1.2.3 also: (a) widens the pad to 2 minutes, (b) on empty result, dumps
+        # the full log unfiltered (matches ODC behavior - the trace window is still
+        # documented in _Summary.txt for cross-correlation).
+        $padSec  = 120
+        $winStartUtc = $script:TraceStartedAt.ToUniversalTime().AddSeconds(-$padSec)
+        $winEndUtc   = $script:TraceEndedAt.ToUniversalTime().AddSeconds($padSec)
+        $allDo = Get-DeliveryOptimizationLog -ErrorAction Stop
+        $doEntries = $allDo | Where-Object {
+            $tc = if ($_.TimeCreated.Kind -eq [System.DateTimeKind]::Local) {
+                      $_.TimeCreated.ToUniversalTime()
+                  } else {
+                      # Unspecified or Utc - treat as UTC (matches DO log convention)
+                      [System.DateTime]::SpecifyKind($_.TimeCreated, [System.DateTimeKind]::Utc)
+                  }
+            $tc -ge $winStartUtc -and $tc -le $winEndUtc
+        }
+        $useFull = $false
+        if (-not $doEntries) {
+            # Fallback: full log (matches ODC). Better to over-collect than to lose data.
+            $doEntries = $allDo
+            $useFull = $true
+        }
         if ($doEntries) {
             $doEntries | ForEach-Object {
                 "{0} | {1} | {2} | {3} | {4}" -f `
@@ -1160,10 +1198,14 @@ Invoke-Safe 'Delivery Optimization log (trace window)' {
                     $_.Level,
                     $_.Message
             } | Out-File -FilePath $doOut -Encoding UTF8
-            Write-CLog ("       captured {0} DO log entries" -f $doEntries.Count)
+            if ($useFull) {
+                Write-CLog ("       no entries in window; captured full log ({0} entries)" -f $doEntries.Count) -Level WARN
+            } else {
+                Write-CLog ("       captured {0} DO log entries" -f $doEntries.Count)
+            }
         } else {
-            'No DO log entries in trace window.' | Out-File -FilePath $doOut -Encoding UTF8
-            Write-CLog '       no DO entries in window'
+            'Get-DeliveryOptimizationLog returned no entries.' | Out-File -FilePath $doOut -Encoding UTF8
+            Write-CLog '       Get-DeliveryOptimizationLog returned no entries' -Level WARN
         }
     } catch {
         "Get-DeliveryOptimizationLog unavailable: $($_.Exception.Message)" |

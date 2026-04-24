@@ -129,7 +129,7 @@ The script ships **UTF-8 BOM + CRLF** specifically so PS 5.1 doesn't mis-decode 
 
 ## Version
 
-`v1.2.2` (2026-04-22). See the `Changelog` block at the top of the script for the full history.
+`v1.2.3` (2026-04-24). See the `Changelog` block at the top of the script for the full history.
 
 ---
 
