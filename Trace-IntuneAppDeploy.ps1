@@ -72,6 +72,19 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.2.5  2026-04-24  DO log format compat fix.
+                           v1.2.0-1.2.4 wrote Get-DeliveryOptimizationLog
+                           output as a flat pipe-separated single-line-per-
+                           entry format. Downstream HTML analyzers (Store /
+                           Win32) parse the DO log as Format-List style blocks
+                           - 'Key : Value' lines, blank line between records.
+                           That mismatch made every DO job invisible: the
+                           analyzer would load the (multi-MB) file and still
+                           report 'No Delivery Optimization jobs in this log'.
+                           Fix: emit Format-List blocks with TimeCreated
+                           normalized to ISO-8601 UTC (so JS new Date() parses
+                           it deterministically) and explicit LevelName /
+                           Function / ErrorCode / LineNumber / Message fields.
         1.2.4  2026-04-24  Remote-execution fix.
                            v1.0.1-1.2.3 saved the file as UTF-8 *with* BOM,
                            originally to prevent PS 5.1 ANSI codepage decoding
@@ -238,7 +251,7 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.2.4'
+$APP_VERSION = '1.2.5'
 $APP_BUILD   = '2026-04-24'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
@@ -1215,14 +1228,32 @@ Invoke-Safe 'Delivery Optimization log (trace window)' {
             $useFull = $true
         }
         if ($doEntries) {
-            $doEntries | ForEach-Object {
-                "{0} | {1} | {2} | {3} | {4}" -f `
-                    $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss.fff'),
-                    $_.ProcessId,
-                    $_.ThreadId,
-                    $_.Level,
-                    $_.Message
-            } | Out-File -FilePath $doOut -Encoding UTF8
+            # v1.2.5: emit Format-List style blocks (key : value, blank line between
+            # records). This matches the layout downstream analyzers (Store /
+            # Win32) parse with `split on blank line` + `Key: Value` regexes.
+            # The previous flat pipe-separated format was unparseable, leading to
+            # "No Delivery Optimization jobs in this log" even when the file was
+            # multi-MB. TimeCreated is normalized to ISO-8601 UTC so JS
+            # `new Date()` parses it deterministically regardless of host culture.
+            $doEntries |
+                Select-Object `
+                    @{n='TimeCreated';e={
+                        $tc = if ($_.TimeCreated.Kind -eq [System.DateTimeKind]::Local) {
+                                  $_.TimeCreated.ToUniversalTime()
+                              } else {
+                                  [System.DateTime]::SpecifyKind($_.TimeCreated, [System.DateTimeKind]::Utc)
+                              }
+                        $tc.ToString("yyyy-MM-ddTHH:mm:ss.fffK")
+                    }},
+                    @{n='LevelName';e={ if ($_.LevelName) { $_.LevelName } else { switch ($_.Level) { 1 {'Critical'} 2 {'Error'} 3 {'Warning'} 4 {'Information'} 5 {'Verbose'} default {"Level$($_.Level)"} } } }},
+                    @{n='ProcessId';e={ $_.ProcessId }},
+                    @{n='ThreadId';e={ $_.ThreadId }},
+                    @{n='Function';e={ $_.Function }},
+                    @{n='ErrorCode';e={ $_.ErrorCode }},
+                    @{n='LineNumber';e={ $_.LineNumber }},
+                    @{n='Message';e={ $_.Message }} |
+                Format-List |
+                Out-File -FilePath $doOut -Encoding UTF8 -Width 4096
             if ($useFull) {
                 Write-CLog ("       no entries in window; captured full log ({0} entries)" -f $doEntries.Count) -Level WARN
             } else {
