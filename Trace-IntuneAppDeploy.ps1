@@ -9,17 +9,32 @@
     deployment window:
 
         1. Takes a baseline (IME log positions, installed apps, CP state).
-        2. Starts a full network trace (netsh trace, InternetClient_dbg scenario
-            -  captures packets + TLS + CAPI2 + DNS + WinINET).
-        3. Opens a seek-to-end stream on IntuneManagementExtension.log for
+        2. Starts the network capture (v1.4.0 - two legs, see below):
+             - ETW leg: netsh trace scenario=InternetClient_dbg PLUS explicit
+               Delivery Optimization / BITS / Windows Update / Store /
+               AppXDeployment / WinHTTP / WebIO providers. The scenario on
+               its own is WinINet / user-context biased; the bytes for a
+               Store or WinGet app come down dosvc, BITS or the WU agent
+               under SYSTEM over WinHTTP, which the scenario alone misses.
+             - Packet leg: pktmon header-only capture (default) so a multi-
+               hundred-MB app download cannot wrap the circular buffer and
+               destroy the beginning of the window. Converted to .pcapng on
+               stop so Wireshark and the HTML analyzers can ingest it.
+        3. Snapshots the network stack (proxy / PAC / DNS / DO config /
+           sockets) and probes every Store, WinGet, Delivery-Optimization,
+           Windows-Update and Intune endpoint for DNS + TCP + TLS health,
+           recording the presented certificate chain so TLS interception by
+           a MITM proxy is caught explicitly rather than inferred.
+        4. Opens a seek-to-end stream on IntuneManagementExtension.log for
            live console tailing.
-        4. PAUSES and prompts the operator to trigger the install from the
+        5. PAUSES and prompts the operator to trigger the install from the
            Company Portal app or web portal. Live-tails IME log to console
            while waiting.
-        5. On [ENTER], stops the trace, flushes netsh capture, diffs baseline
-           vs end-state, extracts the IME log delta for the trace window,
+        6. On [ENTER], re-snapshots the network stack, stops both capture
+           legs, converts the packet ETL to .pcapng, diffs baseline vs
+           end-state, extracts the IME log delta for the trace window,
            exports event log entries time-filtered to the window.
-        6. Packages into an ODC-style ZIP with Commands\, Files\, Registry\,
+        7. Packages into an ODC-style ZIP with Commands\, Files\, Registry\,
            EventLogs\, and new Network\ + Trace\ folders.
 
     Output is scoped to the app-deployment path: IME logs, AppxDeployment,
@@ -38,12 +53,50 @@
     Default: 15.
 
 .PARAMETER NoNetworkTrace
-    Skip netsh trace. Use on environments where network capture is restricted
+    Skip the whole network capture (ETW leg, packet leg, stack snapshot and
+    endpoint probe). Use on environments where network capture is restricted
     by policy, or where a separate tool (Wireshark / pktmon) is already
     capturing.
 
+.PARAMETER PacketCapture
+    How raw frames are captured. Default: Headers.
+
+      Headers  pktmon captures every frame truncated to -PacketBytes. Keeps
+               IP / TCP / TLS-SNI / HTTP headers for the ENTIRE window at a
+               fraction of the size, so a large app download cannot wrap the
+               circular buffer and lose the start of the deployment. netsh
+               runs ETW-only (capture=no) alongside it.
+      Full     Legacy v1.3.x behaviour - netsh trace capture=yes, full frames,
+               no pktmon. Payload bytes are TLS-encrypted anyway, so this is
+               mostly useful for plain-HTTP CDN / DO traffic analysis.
+      Off      No frame capture; ETW + snapshot + endpoint probe only.
+
+.PARAMETER PacketBytes
+    Per-frame truncation length for -PacketCapture Headers. Default: 768.
+
+    pktmon counts from the start of the Ethernet frame, so usable payload is
+    roughly PacketBytes minus ~70 bytes of Ethernet + IP + TCP headers. A real
+    Delivery Optimization content fetch has a ~500-byte request head - a
+    ~350-char GET line (/filestreamingservice/files/<guid>?P1..P4&
+    cacheHostOrigin=<cdn host>) plus Connection / Accept / Range / User-Agent
+    / Host - so 768 is the smallest slice that reliably captures all of it.
+    Raise to 1536 if you also want response headers.
+
 .PARAMETER NetTraceMaxSizeMB
-    Max size for the netsh trace etl (circular). Default: 512.
+    Max size cap for the netsh ETL and the pktmon ETL (each, circular).
+    Default: 1024.
+
+.PARAMETER NoEndpointProbe
+    Skip the Store / WinGet / DO / WU / Intune endpoint reachability +
+    TLS-chain probe.
+
+.PARAMETER Etl2PcapngPath
+    Full path to etl2pcapng.exe. When supplied it is preferred over the
+    in-box 'pktmon etl2pcap' converter (it preserves per-process comments).
+    Optional - conversion falls back to pktmon automatically.
+
+.PARAMETER NoPcapConvert
+    Keep the raw .etl only; skip .pcapng conversion.
 
 .PARAMETER NoOpen
     Do not open Explorer to the output location when finished.
@@ -58,6 +111,14 @@
     .\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace
 
 .EXAMPLE
+    # Full frames instead of headers (plain-HTTP CDN / DO payload analysis)
+    .\Trace-IntuneAppDeploy.ps1 -PacketCapture Full -NetTraceMaxSizeMB 4096
+
+.EXAMPLE
+    # Long window, bigger header slice, external converter
+    .\Trace-IntuneAppDeploy.ps1 -MaxMinutes 45 -PacketBytes 512 -Etl2PcapngPath 'C:\Tools\etl2pcapng.exe'
+
+.EXAMPLE
     # One-liner
     irm https://raw.githubusercontent.com/1nFlight/ODC-Reduced/main/Trace-IntuneAppDeploy.ps1 | iex
 
@@ -68,6 +129,192 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.4.3  2026-07-27  Two fixes from the second live capture
+                           (ANNOUNVM 11:59, 234 s, Edge/Copilot/CompanyPortal
+                           update wave - a real multi-hundred-MB DO download).
+
+                           (1) ETW LEG WAS 503 MB IN 234 s (~129 MB/min). At
+                               -MaxMinutes 20 that is ~2.6 GB and would wrap
+                               any sane cap. Cause: three of the nine extra
+                               providers - WinINet, WinHttp, WebIO - are
+                               ALREADY in the InternetClient_dbg scenario
+                               (confirmed via 'netsh trace show scenario
+                               InternetClient_dbg'). Re-declaring a provider
+                               the scenario owns REPLACES its tuned keyword
+                               mask with the keywords=0xFFFFFFFFFFFFFFFF
+                               level=5 we passed, turning three already-chatty
+                               network providers fully verbose. Dropped all
+                               three; the extra set is now only the five the
+                               scenario genuinely lacks (DeliveryOptimization,
+                               Bits-Client, WindowsUpdateClient, Store,
+                               AppXDeployment-Server), which is what the whole
+                               provider addition was for.
+
+                           (2) -PacketBytes 512 -> 768. Verified against the
+                               actual DO fetches in the capture: the request
+                               head is a ~350-char GET line
+                               (/filestreamingservice/files/<guid>?P1..P4&
+                               cacheHostOrigin=msedge.b.tlu.dl.delivery.mp.
+                               microsoft.com) followed by Connection / Accept
+                               / Range: bytes=<lo>-<hi> / User-Agent / Host.
+                               512 captured through the Range header then cut
+                               inside 'User-Age', so Host never made it. 768
+                               captures the whole head with margin. Cost is
+                               ~1.5x on the packet ETL (46 MB -> ~65 MB for
+                               this window), trivial next to the ETW leg.
+
+                           Confirmed correct in this capture: the v1.4.1
+                           port-80 decision for the DO content CDN. The DO log
+                           holds 9,838 delivery.mp URLs and every single one
+                           is http:// - zero https. Endpoint probe returned
+                           15/15 OK with no interception false positive.
+
+        1.4.2  2026-07-27  -PacketBytes default 256 -> 512, from inspecting
+                           the first live capture's .pcapng. The 134 s window
+                           did contain the whole Store/WinGet control plane -
+                           TLS SNI for storeedgefd (69 hits), displaycatalog,
+                           licensing.mp, purchase.mp, cdn.winget, do.dsp.mp,
+                           dl / tlu.dl.delivery.mp and manage.microsoft.com -
+                           so SNI-level attribution worked. But every
+                           plain-HTTP 'Host:' header was cut mid-value
+                           ('store-images.s-micro', 's-micros', 's-microso'):
+                           pktmon counts --pkt-size from the start of the
+                           Ethernet frame, and 256 minus ~70 bytes of
+                           Eth+IP+TCP left only ~190 bytes of payload, which a
+                           DO content GET path exhausts before reaching Host.
+                           Plain HTTP is precisely where Delivery Optimization
+                           fetches the app payload, so that was the one place
+                           the truncation cost real information. 512 leaves
+                           ~440 bytes - still ~2% of full-frame capture.
+
+        1.4.1  2026-07-27  Endpoint-probe calibration, from the first live
+                           run (ANNOUNVM, 2026-07-27 10:40). The capture
+                           legs all worked - 8/9 providers bound, pktmon
+                           2.94 MB for 134 s vs 114.5 MB for the ETW leg,
+                           valid pcapng - but the probe reported
+                           TLS-INTERCEPTION-SUSPECTED on
+                           tlu.dl.delivery.mp.microsoft.com and
+                           dl.delivery.mp.microsoft.com. That was a FALSE
+                           POSITIVE. Two causes, both fixed:
+
+                           (1) WRONG PORT. *.dl.delivery.mp.microsoft.com
+                               is the Delivery Optimization content CDN and
+                               is fetched over plain HTTP (integrity comes
+                               from the hashes in the update metadata, not
+                               from TLS). Probing it on 443 lands on the
+                               Fastly edge's fallback certificate
+                               (CN=fallback.tls.fastly.net, issuer
+                               Certainly - a real public CA) which says
+                               nothing about the path the download takes.
+                               Both endpoints now probe port 80.
+
+                           (2) WRONG DISCRIMINATOR. v1.4.0 flagged any
+                               chain root whose SUBJECT was outside a
+                               hardcoded CA-name whitelist. That whitelist
+                               can never be complete (it missed Certainly,
+                               and would equally miss GTS, SSL.com, Certum,
+                               Buypass, HARICA...) and an interception
+                               proxy is free to name its root 'DigiCert
+                               Global Root G2' anyway. Replaced with a
+                               store-membership test: a CA in the Microsoft
+                               Root Program appears in BOTH
+                               Cert:\LocalMachine\Root AND
+                               Cert:\LocalMachine\AuthRoot (verified: every
+                               clean endpoint in the live run resolved to
+                               DigiCert Global Root G2/G3, present in both).
+                               A root in Root but NOT in AuthRoot, and not
+                               one of Microsoft's own, was installed
+                               locally - GPO, Intune, or a proxy's setup
+                               routine - which is exactly what interception
+                               looks like.
+
+                           Verdicts are now ranked so benign cases can
+                           never be reported as interception:
+                           CERT-NAME-MISMATCH (CDN default/fallback cert or
+                           wrong port) > TLS-INTERCEPTION-SUSPECTED
+                           (locally-trusted non-program root) >
+                           TLS-CHAIN-UNTRUSTED > TLS-CHAIN-INVALID > OK.
+                           The framework's own SslPolicyErrors is captured
+                           from the validation callback rather than
+                           re-derived, and recorded per endpoint alongside
+                           the root thumbprint and its store membership.
+
+                           Snapshot gains a 'Locally installed root CAs'
+                           section (Root minus Microsoft Root Program) so
+                           any interception verdict can be explained from
+                           the same ZIP.
+
+        1.4.0  2026-07-27  Network capture overhaul. v1.3.x captured
+                           'netsh trace scenario=InternetClient_dbg
+                           capture=yes maxSize=512' and shipped the raw
+                           .etl. Four concrete problems with that:
+
+                           (1) BUFFER WRAP. capture=yes writes full frames
+                               into a 512 MB circular buffer. A Store or
+                               WinGet app of a few hundred MB fills that in
+                               seconds, so by the time the operator pressed
+                               ENTER the beginning of the window - the
+                               catalog lookup, the licensing call, the DO
+                               job setup, i.e. where the failures actually
+                               live - had already been overwritten. New
+                               default -PacketCapture Headers uses pktmon
+                               with --pkt-size 256, keeping every frame's
+                               IP/TCP/TLS-SNI/HTTP headers for the whole
+                               window at roughly 2% of the bytes. netsh
+                               drops to capture=no (ETW only) so the two
+                               legs don't fight over NDIS. -PacketCapture
+                               Full restores the old behaviour.
+
+                           (2) UNREADABLE OUTPUT. The .etl was packaged
+                               as-is. The Store / Win32 / NetTrace HTML
+                               analyzers ingest .pcapng, not .etl, so the
+                               single largest artifact in the ZIP was dead
+                               weight. Now converted at stop via
+                               etl2pcapng.exe (-Etl2PcapngPath) or the
+                               in-box 'pktmon etl2pcap'. -NoPcapConvert
+                               keeps the legacy behaviour.
+
+                           (3) WRONG PROVIDERS. InternetClient_dbg is
+                               WinINet / user-context biased. Store and
+                               WinGet payloads do not travel over WinINet:
+                               they come down Delivery Optimization
+                               (dosvc), BITS, or the WU agent, running as
+                               SYSTEM over WinHTTP. Those providers are
+                               now resolved by name via 'logman query
+                               providers' and appended to the netsh
+                               command line (DeliveryOptimization,
+                               Bits-Client, WindowsUpdateClient, Store,
+                               AppXDeploymentServer, WinHttp, WinINet,
+                               WebIO). Providers absent on the running
+                               build are skipped rather than failing the
+                               start, and the whole provider set is
+                               dropped with a retry if netsh rejects it.
+
+                           (4) NO CONTEXT. A packet capture without the
+                               proxy / PAC / DNS / DO configuration that
+                               produced it is hard to read. Added a
+                               Network\Diagnostics snapshot taken before
+                               AND after the window (ipconfig /all,
+                               /displaydns, route print, netsh winhttp
+                               show proxy, WinINET proxy policy keys,
+                               DNS client servers, netstat, Get-DOConfig,
+                               Get-DeliveryOptimizationStatus / PerfSnap,
+                               DO policy hive, winget source list) plus a
+                               per-endpoint probe of the Store / WinGet /
+                               DO / WU / Intune endpoint set: DNS resolve,
+                               TCP connect + latency, TLS handshake, and
+                               the presented leaf + chain root. A root
+                               outside the well-known public/Microsoft CA
+                               set is reported as
+                               TLS-INTERCEPTION-SUSPECTED - the dominant
+                               silent killer of Store and WinGet installs,
+                               and something the encrypted capture alone
+                               can never show. -NoEndpointProbe opts out.
+
+                           Defaults changed: -NetTraceMaxSizeMB 512 -> 1024.
+                           New params: -PacketCapture, -PacketBytes,
+                           -NoEndpointProbe, -Etl2PcapngPath, -NoPcapConvert.
+
         1.3.6  2026-04-24  Forward-ported three published fixes from the
                            1.2.x branch that v1.3.0-1.3.5 had regressed:
 
@@ -727,8 +974,31 @@ param(
 
     [switch]$NoNetworkTrace,
 
-    [ValidateRange(64, 4096)]
-    [int]$NetTraceMaxSizeMB = 512,
+    # v1.4.0: frame-capture strategy. See .PARAMETER PacketCapture.
+    [ValidateSet('Headers', 'Full', 'Off')]
+    [string]$PacketCapture = 'Headers',
+
+    # v1.4.0: per-frame truncation for -PacketCapture Headers.
+    # v1.4.3: 256 -> 512 -> 768. pktmon counts from the start of the Ethernet
+    # frame. Measured against a real Delivery Optimization content fetch, the
+    # request head is ~500 bytes of payload: a ~350-char GET line
+    # (/filestreamingservice/files/<guid>?P1..P4&cacheHostOrigin=<cdn host>)
+    # plus Connection / Accept / Range / User-Agent / Host. 512 cut it inside
+    # User-Agent, losing Host; 768 captures the whole head with margin.
+    [ValidateRange(64, 65535)]
+    [int]$PacketBytes = 768,
+
+    [ValidateRange(64, 8192)]
+    [int]$NetTraceMaxSizeMB = 1024,
+
+    # v1.4.0: skip the endpoint reachability / TLS-chain probe.
+    [switch]$NoEndpointProbe,
+
+    # v1.4.0: optional etl2pcapng.exe; preferred over 'pktmon etl2pcap'.
+    [string]$Etl2PcapngPath,
+
+    # v1.4.0: keep raw .etl only, skip .pcapng conversion.
+    [switch]$NoPcapConvert,
 
     # v1.3.5: When set, enables Microsoft-Windows-CAPI2/Operational for the
     # trace window and disables it afterwards. CAPI2 is the authoritative
@@ -746,8 +1016,8 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.3.6'
-$APP_BUILD   = '2026-04-22'
+$APP_VERSION = '1.4.3'
+$APP_BUILD   = '2026-07-27'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:Computer  = $env:COMPUTERNAME
@@ -859,6 +1129,351 @@ function Get-InstalledAppInventory {
     return $all | Sort-Object DisplayName, DisplayVersion
 }
 
+# ---------------------------------------------------------------------------
+# v1.4.0 network-capture helpers
+# ---------------------------------------------------------------------------
+
+$script:EtwProviderCache = $null
+
+function Resolve-EtwProvider {
+    <#
+        Resolves a registered ETW provider NAME to its GUID via
+        'logman query providers'. Returns $null when the provider is not
+        registered on this build, so callers can skip it instead of poisoning
+        the whole netsh command line.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $script:EtwProviderCache) {
+        $script:EtwProviderCache = @{}
+        try {
+            $raw = & logman.exe query providers 2>$null
+            foreach ($line in $raw) {
+                $m = [regex]::Match($line, '^(?<n>.*?)\s+(?<g>\{[0-9A-Fa-f\-]{36}\})\s*$')
+                if ($m.Success) {
+                    $key = $m.Groups['n'].Value.Trim().ToLowerInvariant()
+                    if ($key -and -not $script:EtwProviderCache.ContainsKey($key)) {
+                        $script:EtwProviderCache[$key] = $m.Groups['g'].Value
+                    }
+                }
+            }
+        } catch { }
+    }
+
+    $k = $Name.ToLowerInvariant()
+    if ($script:EtwProviderCache.ContainsKey($k)) { return $script:EtwProviderCache[$k] }
+    return $null
+}
+
+function Invoke-CaptureCmd {
+    <#
+        Runs a scriptblock and appends stdout+stderr to a snapshot file.
+        Never throws - a missing cmdlet on an older build must not abort the
+        rest of the snapshot.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][scriptblock]$Action,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+    $header = @(
+        '=============================================================='
+        "### $Label"
+        "### captured: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))"
+        '=============================================================='
+    )
+    try {
+        $body = & $Action 2>&1 | Out-String -Width 320
+        ($header + $body + '') | Out-File -FilePath $OutFile -Encoding UTF8 -Append
+    } catch {
+        ($header + "FAILED: $($_.Exception.Message)" + '') | Out-File -FilePath $OutFile -Encoding UTF8 -Append
+    }
+}
+
+function Export-NetworkStackSnapshot {
+    <#
+        Point-in-time snapshot of everything that decides HOW the Store /
+        WinGet / DO / WU traffic leaves this box. Taken before and after the
+        trace window so a mid-window proxy or DNS change is visible.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$OutDir,
+        [ValidateSet('pre', 'post')][string]$Phase = 'pre'
+    )
+    Ensure-Dir $OutDir
+    $f = Join-Path $OutDir ("{0}_NetworkStack_{1}.txt" -f $script:Computer, $Phase)
+    if (Test-Path -LiteralPath $f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+
+    Invoke-CaptureCmd 'ipconfig /all'                    { & ipconfig.exe /all }              $f
+    Invoke-CaptureCmd 'ipconfig /displaydns'             { & ipconfig.exe /displaydns }       $f
+    Invoke-CaptureCmd 'route print'                      { & route.exe print }                $f
+    Invoke-CaptureCmd 'netsh winhttp show proxy'         { & netsh.exe winhttp show proxy }   $f
+    Invoke-CaptureCmd 'netsh int tcp show global'        { & netsh.exe int tcp show global }  $f
+    Invoke-CaptureCmd 'netstat -ano (TCP)'               { & netstat.exe -ano -p TCP }        $f
+    Invoke-CaptureCmd 'Get-DnsClientServerAddress'       { Get-DnsClientServerAddress -ErrorAction SilentlyContinue | Format-Table -AutoSize } $f
+    Invoke-CaptureCmd 'WinINET settings (HKCU)'          { Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'WinINET settings (HKLM policy)'   { Get-ItemProperty 'HKLM:\Software\Policies\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'Get-DOConfig'                     { Get-DOConfig -Verbose -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'Get-DeliveryOptimizationStatus'   { Get-DeliveryOptimizationStatus -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'Get-DeliveryOptimizationPerfSnap' { Get-DeliveryOptimizationPerfSnap -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'DO policy hive'                   { Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization' -ErrorAction SilentlyContinue | Format-List * } $f
+    Invoke-CaptureCmd 'winget source list'               { & winget.exe source list }         $f
+
+    # v1.4.1: locally installed roots = present in Trusted Root but NOT in the
+    # Microsoft Root Program store. This is the short, high-signal list an
+    # analyst needs to explain any TLS-INTERCEPTION-SUSPECTED verdict.
+    Invoke-CaptureCmd 'Locally installed root CAs (Root minus Microsoft Root Program)' {
+        $idx = Get-LocalRootStoreIndex
+        $local = foreach ($t in $idx.Root.Keys) {
+            if (-not $idx.AuthRoot.ContainsKey($t)) {
+                $c = Get-Item "Cert:\LocalMachine\Root\$t" -ErrorAction SilentlyContinue
+                if ($c) {
+                    [PSCustomObject]@{
+                        Subject    = $c.Subject
+                        NotAfter   = $c.NotAfter
+                        Thumbprint = $c.Thumbprint
+                        MsOwned    = ($c.Subject -match 'O=Microsoft|CN=Microsoft ')
+                    }
+                }
+            }
+        }
+        "Root store: $($idx.Root.Count)   Microsoft Root Program (AuthRoot): $($idx.AuthRoot.Count)   locally installed: $(@($local).Count)"
+        'MsOwned=False entries are the ones that can produce a TLS-INTERCEPTION-SUSPECTED verdict.'
+        $local | Sort-Object MsOwned, Subject |
+            Format-Table @{ n = 'MsOwned'; e = { $_.MsOwned }; w = 8 },
+                         @{ n = 'NotAfter'; e = { $_.NotAfter.ToString('yyyy-MM-dd') }; w = 10 },
+                         @{ n = 'Thumbprint'; e = { $_.Thumbprint }; w = 40 },
+                         @{ n = 'Subject'; e = { $_.Subject }; w = 160 }
+    } $f
+
+    return $f
+}
+
+# Endpoint set that a Store / WinGet / IME deployment actually touches.
+# NOTE on ports: the *.dl.delivery.mp.microsoft.com content CDN is fetched over
+# plain HTTP by Delivery Optimization (payload integrity comes from the hashes
+# in the update metadata, not from TLS). Probing it on 443 lands on the Fastly
+# edge's fallback certificate (CN=fallback.tls.fastly.net) and tells you
+# nothing about the path the download actually takes - so it is probed on 80.
+$script:DeployEndpoints = @(
+    @{ Name = 'displaycatalog.mp.microsoft.com';        Port = 443; Role = 'Store product catalog' }
+    @{ Name = 'storeedgefd.dsx.mp.microsoft.com';       Port = 443; Role = 'StoreEdgeFD (WinGet msstore source)' }
+    @{ Name = 'licensing.mp.microsoft.com';             Port = 443; Role = 'Store licensing / entitlement' }
+    @{ Name = 'purchase.mp.microsoft.com';              Port = 443; Role = 'Store purchase / free acquire' }
+    @{ Name = 'cdn.winget.microsoft.com';               Port = 443; Role = 'WinGet REST source CDN' }
+    @{ Name = 'fe3.delivery.mp.microsoft.com';          Port = 443; Role = 'Windows Update client web service' }
+    @{ Name = 'tlu.dl.delivery.mp.microsoft.com';       Port = 80;  Role = 'App / update content CDN (DO fetches over HTTP)' }
+    @{ Name = 'dl.delivery.mp.microsoft.com';           Port = 80;  Role = 'App / update content CDN (DO fetches over HTTP)' }
+    @{ Name = 'geo-prod.do.dsp.mp.microsoft.com';       Port = 443; Role = 'Delivery Optimization service' }
+    @{ Name = 'kv801.prod.do.dsp.mp.microsoft.com';     Port = 443; Role = 'Delivery Optimization service' }
+    @{ Name = 'manage.microsoft.com';                   Port = 443; Role = 'Intune / IME check-in' }
+    @{ Name = 'login.microsoftonline.com';              Port = 443; Role = 'Entra ID auth' }
+    @{ Name = 'login.live.com';                         Port = 443; Role = 'MSA auth (Store licensing)' }
+    @{ Name = 'img-prod-cms-rt-microsoft-com.akamaized.net'; Port = 443; Role = 'Store asset CDN' }
+    @{ Name = 'ctldl.windowsupdate.com';                Port = 80;  Role = 'CTL / disallowed-cert list (plain HTTP)' }
+)
+
+$script:RootStoreCache = $null
+
+function Get-LocalRootStoreIndex {
+    <#
+        Thumbprint indexes of the machine's Trusted Root store and of the
+        Microsoft Root Program store (AuthRoot / 'Third-Party Root
+        Certification Authorities').
+
+        A CA in the Microsoft Root Program lands in BOTH. A root present in
+        Root but NOT in AuthRoot - and not one of Microsoft's own roots - was
+        installed locally: GPO, Intune, or a TLS-intercepting proxy's setup
+        routine. THAT is the reliable interception signal.
+
+        A CA-name whitelist is not: it false-positives on legitimate CDN CAs
+        outside the list (Certainly/Fastly, GTS, SSL.com, Certum, ...) and a
+        proxy is free to name its root 'DigiCert Global Root G2' anyway.
+    #>
+    if ($null -eq $script:RootStoreCache) {
+        $r = @{}; $a = @{}
+        try { Get-ChildItem 'Cert:\LocalMachine\Root'     -ErrorAction SilentlyContinue | ForEach-Object { $r[$_.Thumbprint] = $_.Subject } } catch { }
+        try { Get-ChildItem 'Cert:\LocalMachine\AuthRoot' -ErrorAction SilentlyContinue | ForEach-Object { $a[$_.Thumbprint] = $_.Subject } } catch { }
+        $script:RootStoreCache = @{ Root = $r; AuthRoot = $a }
+    }
+    return $script:RootStoreCache
+}
+
+function Test-DeployEndpoint {
+    <#
+        DNS + TCP + TLS probe for one endpoint. The TLS leg deliberately
+        accepts any certificate so the chain the server (or whatever is
+        pretending to be it) presents can be INSPECTED rather than merely
+        rejected. Verdicts are ranked so a benign CDN name mismatch is never
+        reported as interception.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$HostName,
+        [int]$Port = 443,
+        [string]$Role = '',
+        [int]$TimeoutMs = 5000
+    )
+
+    $r = [ordered]@{
+        Host = $HostName; Port = $Port; Role = $Role
+        DnsOk = $false; Addresses = ''
+        TcpOk = $false; TcpMs = $null
+        TlsOk = $false; TlsProtocol = ''; TlsCipher = ''
+        PolicyErrors = ''; NameMatch = ''
+        LeafSubject = ''; LeafIssuer = ''; LeafThumbprint = ''
+        ChainRoot = ''; ChainRootThumbprint = ''; ChainStatus = ''
+        RootInTrustedRoot = ''; RootInMsRootProgram = ''
+        Verdict = ''; Detail = ''
+    }
+
+    try {
+        $ips = [System.Net.Dns]::GetHostAddresses($HostName)
+        if ($ips -and $ips.Count -gt 0) {
+            $r.DnsOk = $true
+            $r.Addresses = (($ips | ForEach-Object { $_.IPAddressToString }) -join ', ')
+        }
+    } catch {
+        $r.Detail = "DNS: $($_.Exception.Message)"
+    }
+    if (-not $r.DnsOk) { $r.Verdict = 'DNS-FAIL'; return [pscustomobject]$r }
+
+    $client = $null
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    try {
+        $client = New-Object System.Net.Sockets.TcpClient
+        $iar = $client.BeginConnect($HostName, $Port, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            throw "connect timed out after ${TimeoutMs}ms"
+        }
+        $client.EndConnect($iar)
+        $sw.Stop()
+        $r.TcpOk  = $true
+        $r.TcpMs  = [int]$sw.ElapsedMilliseconds
+    } catch {
+        $sw.Stop()
+        $r.Detail  = "TCP: $($_.Exception.Message)"
+        $r.Verdict = 'TCP-FAIL'
+        if ($client) { try { $client.Close() } catch { } }
+        return [pscustomobject]$r
+    }
+
+    if ($Port -ne 443) {
+        $r.Verdict = 'OK'
+        try { $client.Close() } catch { }
+        return [pscustomobject]$r
+    }
+
+    $ssl = $null
+    $script:LastSslPolicyErrors = 'None'
+    try {
+        # Capture the framework's own SslPolicyErrors verdict, then return
+        # $true so the handshake completes and the chain can be inspected.
+        $cb  = [System.Net.Security.RemoteCertificateValidationCallback] {
+            param($sn, $c, $ch, $e)
+            $script:LastSslPolicyErrors = $e.ToString()
+            $true
+        }
+        $ssl = New-Object System.Net.Security.SslStream($client.GetStream(), $false, $cb)
+        $ssl.AuthenticateAsClient($HostName)
+
+        $r.TlsOk        = $true
+        $r.TlsProtocol  = $ssl.SslProtocol.ToString()
+        $r.PolicyErrors = $script:LastSslPolicyErrors
+        try { $r.TlsCipher = ('{0}/{1}' -f $ssl.CipherAlgorithm, $ssl.HashAlgorithm) } catch { }
+
+        $nameMismatch = ($r.PolicyErrors -match 'RemoteCertificateNameMismatch')
+        $r.NameMatch  = (-not $nameMismatch)
+
+        $leaf = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2($ssl.RemoteCertificate)
+        $r.LeafSubject    = $leaf.Subject
+        $r.LeafIssuer     = $leaf.Issuer
+        $r.LeafThumbprint = $leaf.Thumbprint
+
+        $chain = New-Object System.Security.Cryptography.X509Certificates.X509Chain
+        $chain.ChainPolicy.RevocationMode = [System.Security.Cryptography.X509Certificates.X509RevocationMode]::NoCheck
+        $built = $chain.Build($leaf)
+        if ($chain.ChainElements.Count -gt 0) {
+            $rootCert = $chain.ChainElements[$chain.ChainElements.Count - 1].Certificate
+            $r.ChainRoot           = $rootCert.Subject
+            $r.ChainRootThumbprint = $rootCert.Thumbprint
+        }
+        $r.ChainStatus = if ($built) { 'Valid' } else { (($chain.ChainStatus | ForEach-Object { $_.Status }) -join ',') }
+
+        $idx = Get-LocalRootStoreIndex
+        $inRoot     = ($r.ChainRootThumbprint -and $idx.Root.ContainsKey($r.ChainRootThumbprint))
+        $inAuthRoot = ($r.ChainRootThumbprint -and $idx.AuthRoot.ContainsKey($r.ChainRootThumbprint))
+        $isMsOwned  = ($r.ChainRoot -match 'O=Microsoft|CN=Microsoft ')
+        $r.RootInTrustedRoot   = $inRoot
+        $r.RootInMsRootProgram = $inAuthRoot
+
+        # Store membership alone is not sufficient: Windows pre-seeds a handful
+        # of legacy public roots (DigiCert Assured ID, High Assurance EV, ...)
+        # into Root without them being in the auto-updated AuthRoot store. So
+        # the interception verdict requires BOTH signals - locally trusted but
+        # outside the Microsoft Root Program, AND a subject that doesn't look
+        # like a public CA. Either signal on its own false-positives.
+        $publicCaNames = 'Microsoft|DigiCert|Baltimore|GlobalSign|Entrust|Sectigo|USERTrust|Comodo|VeriSign|Amazon|ISRG|Let''s Encrypt|DST Root|GeoTrust|Thawte|Go Daddy|Starfield|Certainly|Google Trust|GTS |SSL\.com|Certum|Buypass|HARICA|QuoVadis|IdenTrust|SwissSign|Actalis|D-TRUST|T-TeleSec|Telia|AAA Certificate|Security Communication|Atos|emSign|Certigna|TrustAsia|SecureTrust|AffirmTrust|Network Solutions|COMODO|Cybertrust|SecureSign|OISTE|WISeKey|Hellenic|Firmaprofesional|ANF |E-Tugra|TWCA|NAVER|CFCA|vTrus|BJCA'
+        $looksPublic = ($r.ChainRoot -match $publicCaNames)
+
+        # Ranked so the benign cases can never be reported as interception.
+        if ($nameMismatch) {
+            $r.Verdict = 'CERT-NAME-MISMATCH'
+            $r.Detail  = "presented cert is for '$($r.LeafSubject)' - CDN default/fallback cert or wrong port, not interception"
+        } elseif ($built -and $inRoot -and -not $inAuthRoot -and -not $isMsOwned -and -not $looksPublic) {
+            $r.Verdict = 'TLS-INTERCEPTION-SUSPECTED'
+            $r.Detail  = "chain root '$($r.ChainRoot)' is trusted locally but is NOT in the Microsoft Root Program and is not a known public CA - locally installed (proxy / GPO / Intune)"
+        } elseif (-not $built -and $r.ChainStatus -match 'UntrustedRoot|PartialChain') {
+            $r.Verdict = 'TLS-CHAIN-UNTRUSTED'
+            $r.Detail  = "root '$($r.ChainRoot)' is not trusted by this machine"
+        } elseif (-not $built) {
+            $r.Verdict = 'TLS-CHAIN-INVALID'
+            $r.Detail  = $r.ChainStatus
+        } else {
+            $r.Verdict = 'OK'
+        }
+    } catch {
+        $r.Detail  = "TLS: $($_.Exception.Message)"
+        $r.Verdict = 'TLS-FAIL'
+    } finally {
+        if ($ssl)    { try { $ssl.Dispose() } catch { } }
+        if ($client) { try { $client.Close() } catch { } }
+    }
+
+    return [pscustomobject]$r
+}
+
+function Convert-EtlToPcapng {
+    <#
+        Converts an ndiscap / pktmon ETL to .pcapng so Wireshark and the
+        Store / Win32 / NetTrace HTML analyzers can read it. Prefers
+        etl2pcapng.exe when supplied; otherwise uses the in-box
+        'pktmon etl2pcap'. Returns the output path, or $null.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EtlPath,
+        [string]$Etl2PcapngExe
+    )
+    if (-not (Test-Path -LiteralPath $EtlPath)) { return $null }
+    $out = [System.IO.Path]::ChangeExtension($EtlPath, '.pcapng')
+
+    if ($Etl2PcapngExe -and (Test-Path -LiteralPath $Etl2PcapngExe)) {
+        & $Etl2PcapngExe $EtlPath $out 2>&1 | Out-Null
+        if (Test-Path -LiteralPath $out) { return $out }
+    }
+
+    $pktmon = Get-Command pktmon.exe -ErrorAction SilentlyContinue
+    if ($pktmon) {
+        & $pktmon.Source 'etl2pcap' $EtlPath '--out' $out 2>&1 | Out-Null
+        if (-not (Test-Path -LiteralPath $out)) {
+            # Older builds use -o instead of --out.
+            & $pktmon.Source 'etl2pcap' $EtlPath '-o' $out 2>&1 | Out-Null
+        }
+        if (Test-Path -LiteralPath $out) { return $out }
+    }
+
+    return $null
+}
+
 #endregion
 
 #region Preflight
@@ -965,6 +1580,35 @@ if (-not $NoNetworkTrace) {
     }
 }
 
+# v1.4.0: resolve the effective frame-capture mode up front, so the netsh
+# leg knows whether it owns NDIS (capture=yes) or is ETW-only.
+$script:PacketMode        = if ($NoNetworkTrace) { 'Off' } else { $PacketCapture }
+$script:NetTraceProviders = 0
+$script:PcapngFiles       = @()
+
+if ($script:PacketMode -eq 'Headers') {
+    if (-not (Get-Command pktmon.exe -ErrorAction SilentlyContinue)) {
+        Write-Host 'WARN: pktmon.exe not found on this build - falling back to -PacketCapture Full.' -ForegroundColor Yellow
+        Write-Host '      Frames will be captured in full by netsh; a large download may wrap the buffer.' -ForegroundColor DarkYellow
+        $script:PacketMode = 'Full'
+    } else {
+        $pmStatus = & pktmon.exe status 2>$null
+        if ($pmStatus -match 'Logging Mode|is running|Active') {
+            Write-Host ''
+            Write-Host 'ERROR: A pktmon capture session appears to be active on this machine.' -ForegroundColor Red
+            Write-Host '       Stop it first:  pktmon stop' -ForegroundColor Yellow
+            Write-Host '       Or re-run with -PacketCapture Full (or Off).' -ForegroundColor Yellow
+            Write-Host ''
+            return
+        }
+    }
+}
+
+if ($Etl2PcapngPath -and -not (Test-Path -LiteralPath $Etl2PcapngPath)) {
+    Write-Host "WARN: -Etl2PcapngPath '$Etl2PcapngPath' not found; will fall back to 'pktmon etl2pcap'." -ForegroundColor Yellow
+    $Etl2PcapngPath = $null
+}
+
 # Prepare stage.
 # v1.2.2: ODC-compatible directory layout. All app-deployment artifacts go
 # under Intune\ (Commands\General, Files\Sidecar, Files\General, EventLogs,
@@ -994,6 +1638,8 @@ Ensure-Dir (Join-Path $script:StageRoot 'Network')
 # web portals - it complements (doesn't replace) the netsh trace, which
 # catches IME/AgentExecutor/WinGet traffic invisible to the browser.
 Ensure-Dir (Join-Path $script:StageRoot 'Network\ManualHAR')
+# v1.4.0: network stack snapshots (pre/post) + endpoint probe results.
+Ensure-Dir (Join-Path $script:StageRoot 'Network\Diagnostics')
 Ensure-Dir (Join-Path $script:StageRoot 'Trace')
 '' | Out-File -FilePath $script:LogFile -Encoding UTF8
 
@@ -1233,6 +1879,12 @@ $script:TraceStartedAt = Get-Date
 $script:NetTraceRunning = $false
 $script:NetTraceEtl     = Join-Path $netDir ("NetTrace_{0}.etl" -f $script:Timestamp)
 
+# v1.4.0: second capture leg + diagnostics location.
+$script:PktmonRunning = $false
+$script:PktmonEtl     = Join-Path $netDir ("PktMon_{0}.etl" -f $script:Timestamp)
+$script:NetDiagDir    = Join-Path $netDir 'Diagnostics'
+$script:ProbeResults  = @()
+
 # v1.3.5: -CaptureTlsDiagnostics opt-in. Track whether WE enabled CAPI2
 # (vs. it was already on), so cleanup only touches what we changed.
 $script:Capi2WasEnabled       = $false  # actual channel state when we looked
@@ -1263,26 +1915,140 @@ if ($CaptureTlsDiagnostics) {
 }
 
 if (-not $NoNetworkTrace) {
-    Invoke-Safe 'start network trace (netsh, InternetClient_dbg)' {
-        # capture=yes: include raw frames
-        # persistent=no: trace does not survive reboot
-        # maxSize: circular buffer cap (MB)
-        # scenario=InternetClient_dbg: packets + TLS + CAPI2 + DNS + WinINET
-        # correlation=disabled + traceFile=<path> for predictable output location
-        $arglist = @(
+
+    # --- ETW leg ----------------------------------------------------------
+    # v1.4.0: capture=yes only in Full mode. In Headers mode pktmon owns the
+    # frames and netsh stays ETW-only, so the two legs don't contend and the
+    # ETL stays small enough to survive the whole window.
+    Invoke-Safe 'start ETW network trace (netsh InternetClient_dbg + deployment providers)' {
+        $capture = if ($script:PacketMode -eq 'Full') { 'yes' } else { 'no' }
+
+        $baseArgs = @(
             'trace', 'start',
             'scenario=InternetClient_dbg',
-            'capture=yes',
+            "capture=$capture",
             'persistent=no',
+            'report=disabled',
+            'correlation=disabled',
             "maxSize=$NetTraceMaxSizeMB",
             'overwrite=yes',
             "traceFile=$($script:NetTraceEtl)"
         )
+        # capturetype=both also picks up the vSwitch path, which is where the
+        # traffic actually lives on Hyper-V guests and Windows 365 Cloud PCs.
+        if ($capture -eq 'yes') { $baseArgs += 'capturetype=both' }
+
+        # InternetClient_dbg covers the network layer (TCPIP, Winsock-AFD,
+        # SChannel, DNS-Client, WinINet, WinHttp, WebIO, ...) but knows
+        # nothing about the services that actually move Store / WinGet bytes:
+        # those come down Delivery Optimization (dosvc), BITS or the WU agent,
+        # as SYSTEM. Add ONLY the providers the scenario lacks - re-declaring
+        # one it already owns replaces its tuned keyword mask with
+        # all-keywords/verbose and is what made the v1.4.0-v1.4.2 ETL huge.
+        # Skip any the running build doesn't register rather than failing.
+        $wanted = @(
+            'Microsoft-Windows-DeliveryOptimization'
+            'Microsoft-Windows-Bits-Client'
+            'Microsoft-Windows-WindowsUpdateClient'
+            'Microsoft-Windows-Store'
+            'Microsoft-Windows-AppXDeploymentServer'
+            'Microsoft-Windows-AppXDeployment-Server'
+        )
+        $arglist = @() + $baseArgs
+        $added   = @()
+        foreach ($p in $wanted) {
+            $guid = Resolve-EtwProvider -Name $p
+            if ($guid -and ($added -notcontains $guid)) {
+                $arglist += "provider=$guid"
+                $arglist += 'keywords=0xffffffffffffffff'
+                $arglist += 'level=5'
+                $added   += $guid
+                Write-CLog ("       + provider {0} {1}" -f $p, $guid)
+            } else {
+                Write-CLog ("       - provider {0} not registered on this build (skipped)" -f $p) -Level SKIP
+            }
+        }
+
         $out = & netsh.exe @arglist 2>&1
         if ($LASTEXITCODE -ne 0 -or ($out -match 'failed|error')) {
-            throw ("netsh trace start failed: {0}" -f ($out -join ' | '))
+            # Providers are a bonus, not a requirement. Retry scenario-only.
+            Write-CLog ("       netsh start with extra providers failed: {0}" -f ($out -join ' | ')) -Level WARN
+            Write-CLog '       retrying with scenario only' -Level WARN
+            & netsh.exe trace stop 2>&1 | Out-Null
+            $out = & netsh.exe @baseArgs 2>&1
+            if ($LASTEXITCODE -ne 0 -or ($out -match 'failed|error')) {
+                throw ("netsh trace start failed: {0}" -f ($out -join ' | '))
+            }
+            $added = @()
         }
-        $script:NetTraceRunning = $true
+        $script:NetTraceProviders = $added.Count
+        $script:NetTraceRunning   = $true
+    }
+
+    # --- Packet leg -------------------------------------------------------
+    if ($script:PacketMode -eq 'Headers') {
+        Invoke-Safe ("start packet capture (pktmon, {0}-byte frame headers)" -f $PacketBytes) {
+            # --comp nics: log each frame once at the NIC instead of once per
+            # stack component, so the .pcapng doesn't show 3-5 copies of every
+            # packet. --pkt-size truncates to headers. Default flags (0x032)
+            # already include 0x010 = raw packet.
+            $pmArgs = @(
+                'start', '--capture',
+                '--comp', 'nics',
+                '--pkt-size', "$PacketBytes",
+                '--file-name', $script:PktmonEtl,
+                '--file-size', "$NetTraceMaxSizeMB"
+            )
+            $out = & pktmon.exe @pmArgs 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw ("pktmon start failed (is another capture active?): {0}" -f ($out -join ' | '))
+            }
+            $script:PktmonRunning = $true
+        }
+        if (-not $script:PktmonRunning) {
+            Write-CLog '       no frame capture this run - ETW providers still cover the request/response layer' -Level WARN
+        }
+    }
+
+    # --- Context: stack snapshot + endpoint probe --------------------------
+    # Both run AFTER the capture is live, so the probe's own DNS/TCP/TLS
+    # traffic lands in the trace as a known-good timing reference.
+    Invoke-Safe 'snapshot network stack (pre-window)' {
+        $snap = Export-NetworkStackSnapshot -OutDir $script:NetDiagDir -Phase 'pre'
+        Write-CLog ("       {0}" -f (Split-Path $snap -Leaf))
+    }
+
+    if (-not $NoEndpointProbe) {
+        Invoke-Safe 'probe Store / WinGet / DO / WU / Intune endpoints' {
+            $results = foreach ($ep in $script:DeployEndpoints) {
+                Test-DeployEndpoint -HostName $ep.Name -Port $ep.Port -Role $ep.Role
+            }
+            $script:ProbeResults = @($results)
+
+            $csv = Join-Path $script:NetDiagDir ("{0}_EndpointProbe.csv" -f $script:Computer)
+            $txt = Join-Path $script:NetDiagDir ("{0}_EndpointProbe.txt" -f $script:Computer)
+            $script:ProbeResults | Export-Csv -LiteralPath $csv -NoTypeInformation -Encoding UTF8
+            $script:ProbeResults | Format-List * | Out-String -Width 320 | Out-File -FilePath $txt -Encoding UTF8
+
+            $bad = @($script:ProbeResults | Where-Object { $_.Verdict -ne 'OK' })
+            Write-CLog ("       {0} endpoints probed, {1} not clean" -f $script:ProbeResults.Count, $bad.Count)
+            foreach ($b in $bad) {
+                Write-CLog ("       ! {0,-45} {1}  {2}" -f $b.Host, $b.Verdict, $b.Detail) -Level WARN
+            }
+
+            $mitm = @($script:ProbeResults | Where-Object { $_.Verdict -eq 'TLS-INTERCEPTION-SUSPECTED' })
+            if ($mitm.Count -gt 0) {
+                Write-Host ''
+                Write-Host '  !! TLS INTERCEPTION SUSPECTED on these endpoints:' -ForegroundColor Red
+                foreach ($m in $mitm) {
+                    Write-Host ('     {0}  root={1}' -f $m.Host, $m.ChainRoot) -ForegroundColor Yellow
+                }
+                Write-Host '     Store / WinGet content downloads commonly fail silently in this state.' -ForegroundColor DarkYellow
+                Write-Host ''
+            }
+        }
+    } else {
+        Write-CLog '       -NoEndpointProbe set; skipping endpoint reachability / TLS-chain probe' -Level SKIP
     }
 }
 
@@ -1316,7 +2082,13 @@ Write-Host '  TRACE ACTIVE                                                ' -For
 Write-Host '==============================================================' -ForegroundColor Cyan
 Write-Host ('  Started       : {0}' -f $script:TraceStartedAt.ToString('HH:mm:ss'))
 Write-Host ('  Auto-stop at  : {0}  (+{1} min)' -f $deadline.ToString('HH:mm:ss'), $MaxMinutes)
-Write-Host ('  Network trace : {0}' -f $(if ($NoNetworkTrace) {'disabled'} else {'netsh InternetClient_dbg'}))
+Write-Host ('  Network trace : {0}' -f $(if ($NoNetworkTrace) { 'disabled' } else { ('netsh InternetClient_dbg + {0} extra providers' -f $script:NetTraceProviders) }))
+Write-Host ('  Packet capture: {0}' -f $(
+    if ($NoNetworkTrace) { 'disabled' }
+    elseif ($script:PktmonRunning) { 'pktmon, {0}-byte headers -> .pcapng' -f $PacketBytes }
+    elseif ($script:PacketMode -eq 'Full') { 'netsh capture=yes (full frames)' }
+    else { 'off (ETW only)' }
+))
 Write-Host ('  Live tail     : {0}' -f $(if ($script:TailReader) {'IntuneManagementExtension.log'} else {'unavailable'}))
 Write-Host ''
 Write-Host '  Steps:' -ForegroundColor Yellow
@@ -1553,6 +2325,31 @@ Write-Host ''
 
 #region Stop Traces
 
+# v1.4.0: snapshot the network stack BEFORE tearing the capture down, so the
+# post-window DNS cache, socket table and DO status reflect the deployment
+# that just ran. A pre/post diff exposes mid-window proxy or DNS changes.
+if (-not $NoNetworkTrace -and -not $userAborted) {
+    Invoke-Safe 'snapshot network stack (post-window)' {
+        $snap = Export-NetworkStackSnapshot -OutDir $script:NetDiagDir -Phase 'post'
+        Write-CLog ("       {0}" -f (Split-Path $snap -Leaf))
+    }
+}
+
+if ($script:PktmonRunning) {
+    Write-CLog 'Stopping pktmon packet capture...'
+    try {
+        $out = & pktmon.exe stop 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Write-CLog ("pktmon stop returned exit {0}: {1}" -f $LASTEXITCODE, ($out -join ' | ')) -Level WARN
+        } else {
+            Write-CLog 'pktmon stopped.' -Level OK
+        }
+    } catch {
+        Write-CLog "Exception stopping pktmon: $($_.Exception.Message)" -Level ERROR
+    }
+    $script:PktmonRunning = $false
+}
+
 if ($script:NetTraceRunning) {
     Write-CLog "Stopping netsh trace (flushing buffers  -  this can take ~30s)..."
     try {
@@ -1601,11 +2398,39 @@ if ($script:Capi2EnabledByScript) {
 if ($userAborted) {
     Write-CLog "Abort path: removing staging directory."
     Remove-Item -LiteralPath $script:StageRoot -Recurse -Force -ErrorAction SilentlyContinue
-    # Best-effort: remove partial netsh output
-    if (Test-Path -LiteralPath $script:NetTraceEtl) {
-        Remove-Item -LiteralPath $script:NetTraceEtl -Force -ErrorAction SilentlyContinue
+    # Best-effort: remove partial capture output
+    foreach ($partial in @($script:NetTraceEtl, $script:PktmonEtl)) {
+        if ($partial -and (Test-Path -LiteralPath $partial)) {
+            Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue
+        }
     }
     return
+}
+
+# v1.4.0: convert the frame capture to .pcapng. The raw .etl is unreadable by
+# Wireshark and by the Store / Win32 / NetTrace HTML analyzers, which made the
+# single largest artifact in a v1.3.x ZIP dead weight. Both files are kept -
+# the .etl still holds the ETW records the .pcapng cannot represent.
+if (-not $NoPcapConvert) {
+    $toConvert = @()
+    if (Test-Path -LiteralPath $script:PktmonEtl) { $toConvert += $script:PktmonEtl }
+    if ($script:PacketMode -eq 'Full' -and (Test-Path -LiteralPath $script:NetTraceEtl)) {
+        $toConvert += $script:NetTraceEtl
+    }
+
+    foreach ($etl in $toConvert) {
+        Invoke-Safe ("convert {0} -> .pcapng" -f (Split-Path $etl -Leaf)) {
+            $p = Convert-EtlToPcapng -EtlPath $etl -Etl2PcapngExe $Etl2PcapngPath
+            if ($p) {
+                $script:PcapngFiles += $p
+                Write-CLog ("       {0}  ({1:N2} MB)" -f (Split-Path $p -Leaf), ((Get-Item -LiteralPath $p).Length / 1MB)) -Level OK
+            } else {
+                Write-CLog '       no converter available (etl2pcapng.exe / pktmon etl2pcap) - shipping raw .etl only' -Level WARN
+            }
+        }
+    }
+} elseif (-not $NoNetworkTrace) {
+    Write-CLog '       -NoPcapConvert set; shipping raw .etl only' -Level SKIP
 }
 
 #endregion
@@ -3153,9 +3978,41 @@ Invoke-Safe 'write _Summary.txt' {
     $lines += "MaxMinutes        : $MaxMinutes"
     $lines += "NetworkTrace      : $(-not $NoNetworkTrace)"
     if (-not $NoNetworkTrace) {
+        $lines += "  packet mode     : $script:PacketMode$(if ($script:PacketMode -eq 'Headers') { " (pktmon, ${PacketBytes}-byte frames)" })"
+        $lines += "  extra providers : $script:NetTraceProviders"
         $lines += "  netsh etl       : $script:NetTraceEtl"
         if (Test-Path -LiteralPath $script:NetTraceEtl) {
-            $lines += "  netsh etl size  : {0:N2} MB" -f ((Get-Item -LiteralPath $script:NetTraceEtl).Length/1MB)
+            $netEtlMb = (Get-Item -LiteralPath $script:NetTraceEtl).Length / 1MB
+            $lines += "  netsh etl size  : {0:N2} MB" -f $netEtlMb
+            if ($netEtlMb -ge ($NetTraceMaxSizeMB * 0.98)) {
+                $lines += "  !! netsh etl hit the ${NetTraceMaxSizeMB} MB cap - the circular buffer wrapped and the"
+                $lines += "     earliest part of the window was overwritten. Re-run with a larger"
+                $lines += "     -NetTraceMaxSizeMB or a shorter -MaxMinutes."
+            }
+        }
+        if (Test-Path -LiteralPath $script:PktmonEtl) {
+            $pmMb = (Get-Item -LiteralPath $script:PktmonEtl).Length / 1MB
+            $lines += "  pktmon etl      : $script:PktmonEtl"
+            $lines += "  pktmon etl size : {0:N2} MB" -f $pmMb
+            if ($pmMb -ge ($NetTraceMaxSizeMB * 0.98)) {
+                $lines += "  !! pktmon etl hit the ${NetTraceMaxSizeMB} MB cap - frames were dropped/wrapped."
+            }
+        }
+        foreach ($pc in $script:PcapngFiles) {
+            $lines += "  pcapng          : $pc ({0:N2} MB)" -f ((Get-Item -LiteralPath $pc).Length / 1MB)
+        }
+        if ($script:ProbeResults.Count -gt 0) {
+            $lines += ''
+            $lines += '--- ENDPOINT PROBE ---'
+            foreach ($r in $script:ProbeResults) {
+                $lines += "  {0,-45} {1,-28} tcp={2}ms {3}" -f $r.Host, $r.Verdict, $r.TcpMs, $r.TlsProtocol
+                if ($r.Verdict -eq 'TLS-INTERCEPTION-SUSPECTED') {
+                    $lines += "      chain root: $($r.ChainRoot)"
+                    $lines += "      leaf issuer: $($r.LeafIssuer)"
+                } elseif ($r.Detail) {
+                    $lines += "      $($r.Detail)"
+                }
+            }
         }
     }
     $lines += ''
@@ -3200,6 +4057,15 @@ if (Test-Path -LiteralPath $script:ZipPath) {
     Write-Host '==============================================================' -ForegroundColor Green
     Write-Host ('  ZIP: {0} ({1:N2} MB)' -f $script:ZipPath, ($zipSize/1MB)) -ForegroundColor Green
     Write-Host '==============================================================' -ForegroundColor Green
+    if (-not $NoNetworkTrace) {
+        Write-Host ('  Network\   : {0} pcapng, {1} extra ETW providers' -f $script:PcapngFiles.Count, $script:NetTraceProviders) -ForegroundColor DarkGray
+        $badProbe = @($script:ProbeResults | Where-Object { $_.Verdict -ne 'OK' })
+        if ($badProbe.Count -gt 0) {
+            Write-Host ('  Endpoints  : {0} of {1} not clean - see Network\Diagnostics\*_EndpointProbe.txt' -f $badProbe.Count, $script:ProbeResults.Count) -ForegroundColor Yellow
+        } elseif ($script:ProbeResults.Count -gt 0) {
+            Write-Host ('  Endpoints  : all {0} clean (DNS + TCP + TLS chain)' -f $script:ProbeResults.Count) -ForegroundColor DarkGray
+        }
+    }
     Write-Host ''
 
     if (-not $NoOpen) {
