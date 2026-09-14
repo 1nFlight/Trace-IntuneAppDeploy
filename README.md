@@ -13,9 +13,9 @@ As of **v1.4.x** the network capture is two legs — a tuned ETW trace plus a he
 1. **Baseline** — Captures IME log positions (per-file length, creation time, last-write time), installed apps from the registry Uninstall keys, all `Get-AppxPackage -AllUsers`, and Company Portal state.
 2. **Start network capture** — Two legs: `netsh trace scenario=InternetClient_dbg` for ETW (plus the Delivery Optimization / BITS / Windows Update / Store / AppXDeployment providers the scenario lacks), and `pktmon` for header-only frames. Skip with `-NoNetworkTrace`.
 3. **Snapshot + probe** — Proxy / PAC / DNS / routes / sockets / DO config, then a DNS + TCP + TLS-chain probe of the Store, WinGet, DO, WU and Intune endpoints.
-4. **Live tail** — Opens a seek-to-end stream on `IntuneManagementExtension.log` and streams new lines to the console while you trigger the install from Company Portal.
+4. **DO trace + live tail** — Starts the DO troubleshooter's verbose reproduction workflow, waits until it is ready, then streams new `IntuneManagementExtension.log` lines to the console while you trigger the install from Company Portal.
 5. **Stop on `[ENTER]`** — Or auto-stops at the `-MaxMinutes` safety timeout.
-6. **Delta + filtered exports** — IME log delta (handles mid-trace log rotation), installed-apps diff (Win32 *and* MSIX/Store), event channels filtered to the trace window via XPath, WinGet per-user logs, WPM-*.txt, `Get-DeliveryOptimizationLog`, `Get-WindowsUpdateLog`, raw DO/WU ETLs. The packet ETL is converted to `.pcapng`.
+6. **Delta + filtered exports** — IME log delta (handles mid-trace log rotation), installed-apps diff (Win32 *and* MSIX/Store), event channels filtered to the trace window via XPath, WinGet per-user logs, WPM-*.txt, the verbose Delivery Optimization reproduction trace, `Get-WindowsUpdateLog`, and raw WU ETLs. The packet ETL is converted to `.pcapng`.
 7. **ZIP** — ODC-style layout under `Intune\` (Commands, Files, EventLogs, RegistryKeys) plus trace-only folders (`Baseline\`, `Network\`, `Trace\`) at the stage root, with a synthesized `Intune.xml` manifest.
 
 ---
@@ -27,6 +27,7 @@ As of **v1.4.x** the network capture is two legs — a tuned ETW trace plus a he
 - A **console host** (PowerShell ISE is detected; you'll be offered a 1-click relaunch into `powershell.exe`, or a degraded batch-tail mode).
 - No other `netsh trace` or `pktmon` session active (the script aborts with a clear error if one is).
 - `pktmon.exe` for the default header-only packet capture. Absent on older builds — the script falls back to `-PacketCapture Full` automatically.
+- Access to PowerShell Gallery, or a trusted local `DeliveryOptimizationTroubleshooter.ps1` supplied with `-DeliveryOptimizationTroubleshooterPath`. Not required with `-NoDeliveryOptimizationTrace`.
 
 ---
 
@@ -66,6 +67,8 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
 | `-NoEndpointProbe` | *(off)* | Skip the Store / WinGet / DO / WU / Intune reachability + TLS-chain probe. |
 | `-Etl2PcapngPath` | *(none)* | Path to `etl2pcapng.exe`. Preferred over the in-box `pktmon etl2pcap` when supplied. |
 | `-NoPcapConvert` | *(off)* | Keep the raw `.etl` only; skip `.pcapng` conversion. |
+| `-DeliveryOptimizationTroubleshooterPath` | *(auto)* | Path to Microsoft's DO troubleshooter. Otherwise a trusted installed copy is used, or pinned version 1.3.0 is downloaded and hash-verified. |
+| `-NoDeliveryOptimizationTrace` | *(off)* | Skip the DO workflow, including its download, service restarts, and removal of older DO logs. |
 | `-CaptureTlsDiagnostics` | *(off)* | Enable `Microsoft-Windows-CAPI2/Operational` for the window and restore it afterwards. High event volume. |
 | `-NoOpen` | *(off)* | Do not open Explorer to the output location when finished. |
 
@@ -91,6 +94,12 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
 
 # Custom output folder, no Explorer popup
 .\Trace-IntuneAppDeploy.ps1 -OutputRoot 'C:\Diag' -NoOpen
+
+# Use an already-downloaded official DO troubleshooter
+.\Trace-IntuneAppDeploy.ps1 -DeliveryOptimizationTroubleshooterPath 'C:\Tools\DeliveryOptimizationTroubleshooter.ps1'
+
+# Leave DO logging/service state untouched by the troubleshooter
+.\Trace-IntuneAppDeploy.ps1 -NoDeliveryOptimizationTrace
 ```
 
 ---
@@ -114,13 +123,12 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
     ├── Trace\                           ← live-tail capture, delta extracts
     └── Intune\
         ├── Commands\
-        │   └── General\                 ← %COMPUTERNAME%_<Name>.txt outputs
+        │   └── General\                 ← includes the verbose DO reproduction trace
         ├── Files\
         │   ├── Sidecar\                 ← full IME log copy
         │   ├── General\                 ← WinGet_<user>, misc
         │   ├── WPM\                     ← WPM-*.txt
         │   └── Intune\
-        │       ├── DeliveryOptimization_ETL\
         │       └── WindowsUpdate_ETL\
         ├── EventLogs\                   ← .evtx, time-filtered to trace window
         └── RegistryKeys\                ← .reg exports of Win32 app state keys
@@ -132,12 +140,36 @@ The `Intune\` subtree matches the legacy Microsoft OneDataCollector layout, so t
 
 ## What's in the trace window
 
-Every artifact is filtered to `TraceStartedAt` → `TraceEndedAt` (with a small pad) so the trace window stays the source of truth:
+The deployment window is recorded as `TraceStartedAt` to `TraceEndedAt`. Event exports use padded bounds; DO reproduction events are strictly limited to the DO-ready time through the operator or timeout stop. Baselines and full-copy snapshots retain their existing scope.
 
 - **IME logs** — delta extraction handles four cases: unchanged-same-file, rotation-replacement, new-post-baseline, and lost-tail (rotated-away file with `ROTATED_` prefix).
 - **Installed apps diff** — two sections: *Win32 / MSI / EXE* (registry-based) and *Store / MSIX / Appx* (`Get-AppxPackage -AllUsers`, with added / removed / upgraded).
 - **Event channels** — IME, AppxDeployment, DeviceManagement-Enterprise-Diagnostics-Provider, BITS, Store, AAD, DeliveryOptimization (Operational + Analytic), WindowsUpdateClient, WUSA. Filtered server-side via `wevtutil epl /q:<XPath>`.
-- **Content distribution** — WinGet per-user `DiagOutputDir` (walks all user profiles), WPM-*.txt, `Get-DeliveryOptimizationLog`, `Get-WindowsUpdateLog`, raw DO + WU ETLs.
+- **Content distribution** — WinGet per-user `DiagOutputDir` (walks all user profiles), WPM-*.txt, the `logs-dosvc-repro.txt` verbose trace produced by `DeliveryOptimizationTroubleshooter.ps1 -GenerateSupportBundle -ReproduceIssueWithVerboseLogs`, `Get-WindowsUpdateLog`, and raw WU ETLs. Only the DO reproduction trace is retained; the troubleshooter's other support-bundle files and temporary ZIP are removed.
+
+---
+
+## Delivery Optimization
+
+The collector runs [Microsoft's DO troubleshooter](https://www.powershellgallery.com/packages/DeliveryOptimizationTroubleshooter/1.3.0) with:
+
+```powershell
+DeliveryOptimizationTroubleshooter.ps1 -GenerateSupportBundle -ReproduceIssueWithVerboseLogs
+```
+
+Wait for the collector's **TRACE ACTIVE** banner before triggering the deployment. The troubleshooter runs in a child process with a private temporary directory. The collector forwards Enter or the safety timeout to its reproduction prompt; Q also stops the DO workflow but discards the collection. Cleanup runs on interruptions as well.
+
+Only events from `logs-dosvc-repro.txt` inside the reproduction window are retained. They are streamed into the existing analyzer-compatible `Key : Value` format with UTC timestamps and decoded hexadecimal process/thread IDs:
+
+```text
+Intune\Commands\General\<COMPUTER>_Get-DeliveryOptimizationLog.txt
+```
+
+The original reproduction text does not retain every structured cmdlet field, such as `LineNumber`; unavailable fields are left blank. Existing-history logs, configuration snapshots from the support bundle, raw DO ETLs, the nested ZIP, and temporary tool files are not packaged. If acquisition or capture fails, the collector logs the reason and records that the DO trace is unavailable; it never substitutes historical logs.
+
+**Service and log impact:** the official workflow flushes and stops/restarts DoSvc, which can interrupt other DO downloads, and deletes older timestamped DO logs before reproduction. Start it before the target deployment, not during another DO capture. The collector skips DO capture if trace overrides are already configured. Use `-NoDeliveryOptimizationTrace` when those changes are inappropriate. `-NoNetworkTrace` controls the collector's separate network capture; it does not skip the DO troubleshooter or its health checks. Use both switches when neither workflow should run.
+
+The automatic download is pinned to Gallery **1.3.0** and verified against package and script SHA-256 hashes. Despite the Gallery description, the inspected 1.3.0 script has no Authenticode signature. Local copies must match the pinned script or have a valid Microsoft signature, and must expose both required parameters. Temporary downloads are removed after each run.
 
 ---
 
@@ -217,9 +249,22 @@ The script ships **UTF-8 without BOM, LF line endings** — a BOM survives `irm 
 
 ---
 
+## Tests
+
+Run the isolated regression suite; it uses a fake troubleshooter and stubs device-changing commands:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-DeliveryOptimizationTraceHelpers.ps1
+pwsh -NoProfile -File .\tests\Test-DeliveryOptimizationTraceHelpers.ps1
+```
+
+Add `-CheckGallery` to verify real tool acquisition and trust without executing the downloaded script. Tests cover the readiness/stop handshake, time filtering, output format, Unicode paths/text, unrelated bundle protection, pre-existing trace settings, missing/invalid output, child failure, timeouts, and large redirected output. A live elevated deployment capture is a separate validation step.
+
+---
+
 ## Version
 
-`v1.4.3` (2026-07-27). See the `Changelog` block at the top of the script for the full history.
+`v1.5.0` (2026-09-14). See the `Changelog` block at the top of the script for the full history.
 
 ---
 

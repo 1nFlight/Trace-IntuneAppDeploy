@@ -41,8 +41,8 @@
     DeviceManagement-Enterprise-Diagnostics-Provider, BITS, Store, AAD,
     and the registry keys that track Win32 app state. As of v1.2.0 also
     includes WinGet DiagOutputDir, WPM-*.txt, Get-DeliveryOptimizationLog
-    output, Get-WindowsUpdateLog output, and raw DO/WU ETLs - each filtered
-    to the trace window.
+    verbose reproduction output, Get-WindowsUpdateLog output, and raw WU ETLs -
+    each filtered to the trace window.
 
 .PARAMETER OutputRoot
     Folder where the final ZIP is written. Default: current user's Desktop.
@@ -98,6 +98,15 @@
 .PARAMETER NoPcapConvert
     Keep the raw .etl only; skip .pcapng conversion.
 
+.PARAMETER DeliveryOptimizationTroubleshooterPath
+    Optional path to DeliveryOptimizationTroubleshooter.ps1. When omitted, the
+    collector uses a trusted installed copy or downloads the pinned Microsoft
+    PowerShell Gallery package. Only its verbose reproduction trace is retained.
+
+.PARAMETER NoDeliveryOptimizationTrace
+    Skip the DO troubleshooter workflow. Use when restarting DoSvc or clearing
+    older DO logs is not appropriate, or another DO trace is already running.
+
 .PARAMETER NoOpen
     Do not open Explorer to the output location when finished.
 
@@ -129,6 +138,21 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.5.0  2026-09-14  Delivery Optimization collection now uses the
+                   official DeliveryOptimizationTroubleshooter
+                           support-bundle reproduction workflow. The collector
+                           waits for verbose DO logging to become active, keeps
+                           its existing ENTER / Q / MaxMinutes controls, and
+                           forwards the stop signal to the troubleshooter.
+                           Only events from logs-dosvc-repro.txt inside the
+                           reproduction window are converted into the ODC
+                           command format. Temporary support data is isolated
+                           and deleted. Removed the full-history DO log fallback
+                           and the copy of every rotated raw DO ETL. Added an
+                           explicit -NoDeliveryOptimizationTrace opt-out for
+                           environments where DoSvc restarts or log clearing
+                           are inappropriate.
+
         1.4.3  2026-07-27  Two fixes from the second live capture
                            (ANNOUNVM 11:59, 234 s, Edge/Copilot/CompanyPortal
                            update wave - a real multi-hundred-MB DO download).
@@ -1000,6 +1024,10 @@ param(
     # v1.4.0: keep raw .etl only, skip .pcapng conversion.
     [switch]$NoPcapConvert,
 
+    [string]$DeliveryOptimizationTroubleshooterPath,
+
+    [switch]$NoDeliveryOptimizationTrace,
+
     # v1.3.5: When set, enables Microsoft-Windows-CAPI2/Operational for the
     # trace window and disables it afterwards. CAPI2 is the authoritative
     # source for certificate chain validation failures (untrusted root,
@@ -1016,8 +1044,8 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.4.3'
-$APP_BUILD   = '2026-07-27'
+$APP_VERSION = '1.5.0'
+$APP_BUILD   = '2026-09-14'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:Computer  = $env:COMPUTERNAME
@@ -1075,6 +1103,335 @@ function Invoke-Safe {
 }
 
 function Ensure-Dir { param([string]$Path) if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
+
+function Test-DeliveryOptimizationTroubleshooterTrust {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+        $Path,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    if ($parseErrors -or -not $ast.ParamBlock) { return $false }
+    $parameterNames = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
+    if ($parameterNames -notcontains 'GenerateSupportBundle' -or
+        $parameterNames -notcontains 'ReproduceIssueWithVerboseLogs') {
+        return $false
+    }
+
+    $signature = Get-AuthenticodeSignature -FilePath $Path -ErrorAction SilentlyContinue
+    if ($signature.Status -eq [System.Management.Automation.SignatureStatus]::Valid -and
+        $signature.SignerCertificate -and
+        $signature.SignerCertificate.Subject -match '(^|,\s*)O=Microsoft Corporation(,|$)') {
+        return $true
+    }
+
+    $trustedScriptHash = '7148B382D772C1195706F3D03220A61BD8E9CF46A1292AD55A526CAB5FD51EB5'
+    return ((Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction SilentlyContinue).Hash -eq $trustedScriptHash)
+}
+
+function Resolve-DeliveryOptimizationTroubleshooter {
+    param(
+        [string]$PreferredPath,
+        [Parameter(Mandatory)][string]$DownloadDirectory
+    )
+
+    $candidates = @()
+    if ($PreferredPath) {
+        if (-not (Test-Path -LiteralPath $PreferredPath -PathType Leaf)) {
+            Write-CLog "Delivery Optimization troubleshooter not found: $PreferredPath" -Level WARN
+            return $null
+        }
+        $candidates += (Resolve-Path -LiteralPath $PreferredPath).Path
+    } else {
+        $installed = Get-Command 'DeliveryOptimizationTroubleshooter.ps1' -CommandType ExternalScript -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($installed) { $candidates += $installed.Source }
+    }
+
+    foreach ($candidate in $candidates) {
+        if (Test-DeliveryOptimizationTroubleshooterTrust -Path $candidate) {
+            Write-CLog "Using trusted DO troubleshooter: $candidate"
+            return $candidate
+        }
+        Write-CLog "Rejected untrusted DO troubleshooter: $candidate" -Level WARN
+        if ($PreferredPath) { return $null }
+    }
+
+    Ensure-Dir $DownloadDirectory
+    $packagePath = Join-Path $DownloadDirectory 'DeliveryOptimizationTroubleshooter.nupkg'
+    $scriptPath  = Join-Path $DownloadDirectory 'DeliveryOptimizationTroubleshooter.ps1'
+    $packageUri  = 'https://www.powershellgallery.com/api/v2/package/DeliveryOptimizationTroubleshooter/1.3.0'
+    $trustedPackageHash = 'B0EDA9E30C348E2572CAF8914E478A4996B7F319D757E057A63D4262F237FF23'
+    $previousSecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol
+
+    try {
+        [System.Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
+        Write-CLog 'Downloading Microsoft DO troubleshooter 1.3.0 from PowerShell Gallery...'
+        Invoke-WebRequest -Uri $packageUri -UseBasicParsing -OutFile $packagePath -TimeoutSec 60 -ErrorAction Stop
+        if ((Get-FileHash -LiteralPath $packagePath -Algorithm SHA256).Hash -ne $trustedPackageHash) {
+            throw 'The downloaded DO troubleshooter package does not match the trusted SHA-256 hash.'
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($packagePath)
+        try {
+            $entry = $archive.Entries | Where-Object { $_.FullName -eq 'DeliveryOptimizationTroubleshooter.ps1' } |
+                Select-Object -First 1
+            if (-not $entry) { throw 'The Gallery package does not contain DeliveryOptimizationTroubleshooter.ps1.' }
+            [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $scriptPath, $true)
+        } finally {
+            $archive.Dispose()
+        }
+
+        if (-not (Test-DeliveryOptimizationTroubleshooterTrust -Path $scriptPath)) {
+            throw 'The extracted DO troubleshooter does not match a trusted Microsoft signature or SHA-256 hash.'
+        }
+        Write-CLog 'Downloaded and hash-verified the Microsoft DO troubleshooter.' -Level OK
+        return $scriptPath
+    } catch {
+        Write-CLog "Unable to acquire the DO troubleshooter: $($_.Exception.Message)" -Level WARN
+        return $null
+    } finally {
+        [System.Net.ServicePointManager]::SecurityProtocol = $previousSecurityProtocol
+        Remove-Item -LiteralPath $packagePath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Start-DeliveryOptimizationTroubleshooterTrace {
+    param(
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][datetime]$Deadline,
+        [Parameter(Mandatory)][string]$WorkingDirectory
+    )
+
+    if ((Get-Date) -ge $Deadline) { throw 'The DO trace startup deadline has already passed.' }
+    if (Test-Path -LiteralPath $WorkingDirectory) { throw 'The DO trace temporary directory must be new.' }
+    $traceRegistryPath = 'Registry::HKEY_USERS\S-1-5-20\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Trace'
+    $traceSettings = Get-ItemProperty -LiteralPath $traceRegistryPath -ErrorAction SilentlyContinue
+    foreach ($settingName in @('TraceLevel_Override', 'TraceFileSizeKBytes', 'TraceFolderSizeKBytes')) {
+        if ($traceSettings -and $traceSettings.PSObject.Properties[$settingName]) {
+            throw 'Delivery Optimization tracing is already customized; leaving the existing trace settings untouched.'
+        }
+    }
+    $powershellExe = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $powershellExe)) {
+        throw "Windows PowerShell was not found at $powershellExe"
+    }
+
+    Ensure-Dir $WorkingDirectory
+    $WorkingDirectory = (Resolve-Path -LiteralPath $WorkingDirectory).Path
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $powershellExe
+    $runnerPath = Join-Path $WorkingDirectory 'Invoke-DOTrace.ps1'
+    [System.IO.File]::WriteAllLines($runnerPath, [string[]]@(
+        '$PSDefaultParameterValues = @{ ''Set-Content:Encoding'' = ''UTF8'' }'
+        '$global:LASTEXITCODE = 0'
+        ('& ''' + $ScriptPath.Replace("'", "''") + ''' -GenerateSupportBundle -ReproduceIssueWithVerboseLogs')
+        'exit $LASTEXITCODE'
+    ), [System.Text.UTF8Encoding]::new($true))
+    $startInfo.Arguments = '-NoLogo -NoProfile -ExecutionPolicy Bypass -File "' + $runnerPath + '"'
+    $startInfo.WorkingDirectory = $WorkingDirectory
+    $startInfo.EnvironmentVariables['TEMP'] = $WorkingDirectory
+    $startInfo.EnvironmentVariables['TMP'] = $WorkingDirectory
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardInput = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    $started = $false
+    $ready = $false
+    $verboseLogsMayBeEnabled = $false
+    try {
+        $started = $process.Start()
+        if (-not $started) { throw 'Failed to start the DO troubleshooter process.' }
+
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $readTask = $process.StandardOutput.ReadLineAsync()
+        while ((Get-Date) -lt $Deadline) {
+            if ($readTask.Wait(100)) {
+                $line = $readTask.Result
+                if ($null -eq $line) { break }
+                if ($line -match 'Enabling verbose logging for issue reproduction') {
+                    $verboseLogsMayBeEnabled = $true
+                }
+                if ($line.Trim().Length -gt 0) { Write-Host ("  [DO] {0}" -f $line) -ForegroundColor DarkGray }
+                if ($line -match 'Please reproduce the issue now') {
+                    $verboseLogsMayBeEnabled = $true
+                    $ready = $true
+                    break
+                }
+                $readTask = $process.StandardOutput.ReadLineAsync()
+            }
+        }
+
+        if (-not $ready) {
+            $stderr = if ($stderrTask.IsCompleted) { $stderrTask.Result.Trim() } else { '' }
+            if ($stderr) { throw "DO troubleshooter did not enter reproduction mode: $stderr" }
+            throw 'DO troubleshooter did not enter reproduction mode before the trace deadline.'
+        }
+
+        return [PSCustomObject]@{
+            Process          = $process
+            OutputTask       = $process.StandardOutput.ReadToEndAsync()
+            ErrorTask        = $stderrTask
+            StartedAt        = Get-Date
+            WorkingDirectory = $WorkingDirectory
+        }
+    } finally {
+        if (-not $ready) {
+            if ($started -and -not $process.HasExited) {
+                $process.Kill()
+                $null = $process.WaitForExit(5000)
+            }
+            if ($verboseLogsMayBeEnabled) {
+                try { Disable-DeliveryOptimizationVerboseLogs -Force -ErrorAction Stop | Out-Null }
+                catch { Write-CLog "DO verbose logging cleanup failed: $($_.Exception.Message)" -Level ERROR }
+            }
+            $process.Dispose()
+            Remove-Item -LiteralPath $WorkingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Convert-DeliveryOptimizationReproductionTrace {
+    param(
+        [Parameter(Mandatory)][System.IO.TextReader]$Reader,
+        [Parameter(Mandatory)][System.IO.TextWriter]$Writer,
+        [Parameter(Mandatory)][datetime]$StartUtc,
+        [Parameter(Mandatory)][datetime]$EndUtc
+    )
+
+    $recordPattern = '^(?<Timestamp>\d{4}-\d{2}-\d{2}T\S+)\s+(?<ProcessId>[0-9a-f]+)\s+(?<ThreadId>[0-9a-f]+)\s+(?<LevelName>[^{}]*?)\{(?<Function>[^}]*)\} ?(?<Message>.*)$'
+    $currentEntry = $null
+    $entryCount = 0
+    while ($true) {
+        $line = $Reader.ReadLine()
+        $recordMatch = if ($null -ne $line) { [regex]::Match($line, $recordPattern, 'IgnoreCase') }
+        if ($null -eq $line -or $recordMatch.Success) {
+            if ($currentEntry -and $currentEntry.TimeCreated -ge $StartUtc -and $currentEntry.TimeCreated -le $EndUtc) {
+                $message = $currentEntry.Message.ToString()
+                $errorMatch = [regex]::Match($message, '\(hr:(?<Code>[0-9a-f]{8})\)\s*$', 'IgnoreCase')
+                $errorCode = if ($errorMatch.Success) {
+                    [int]::Parse($errorMatch.Groups['Code'].Value, [Globalization.NumberStyles]::HexNumber, [Globalization.CultureInfo]::InvariantCulture)
+                } else { '' }
+                $Writer.WriteLine('TimeCreated : {0}', $currentEntry.TimeCreated.ToString('yyyy-MM-ddTHH:mm:ss.fffK', [Globalization.CultureInfo]::InvariantCulture))
+                $Writer.WriteLine('LevelName   : {0}', $currentEntry.LevelName)
+                $Writer.WriteLine('ProcessId   : {0}', $currentEntry.ProcessId)
+                $Writer.WriteLine('ThreadId    : {0}', $currentEntry.ThreadId)
+                $Writer.WriteLine('Function    : {0}', $currentEntry.Function)
+                $Writer.WriteLine('ErrorCode   : {0}', $errorCode)
+                $Writer.WriteLine('LineNumber  : ')
+                $Writer.WriteLine('Message     : {0}', $message.Replace([Environment]::NewLine, [Environment]::NewLine + '              '))
+                $Writer.WriteLine()
+                $entryCount++
+            }
+            if ($null -eq $line) { break }
+
+            $timestamp = [datetimeoffset]::MinValue
+            $dateStyles = [Globalization.DateTimeStyles]::AssumeUniversal -bor [Globalization.DateTimeStyles]::AdjustToUniversal
+            if (-not [datetimeoffset]::TryParse($recordMatch.Groups['Timestamp'].Value, [Globalization.CultureInfo]::InvariantCulture, $dateStyles, [ref]$timestamp)) {
+                throw 'The DO reproduction trace contains an invalid timestamp.'
+            }
+            $currentEntry = [PSCustomObject]@{
+                TimeCreated = $timestamp.UtcDateTime
+                ProcessId   = [Convert]::ToUInt32($recordMatch.Groups['ProcessId'].Value, 16)
+                ThreadId    = [Convert]::ToUInt32($recordMatch.Groups['ThreadId'].Value, 16)
+                LevelName   = $recordMatch.Groups['LevelName'].Value.Trim()
+                Function    = $recordMatch.Groups['Function'].Value
+                Message     = [System.Text.StringBuilder]::new($recordMatch.Groups['Message'].Value)
+            }
+        } elseif ($currentEntry) {
+            if ($line -match '^\d{4}-\d{2}-\d{2}T') {
+                throw 'The DO reproduction trace contains an unsupported record format.'
+            }
+            $null = $currentEntry.Message.AppendLine().Append($line)
+        } elseif (-not [string]::IsNullOrWhiteSpace($line)) {
+            throw 'The DO reproduction trace is not in the expected LogOutput format.'
+        }
+    }
+    return $entryCount
+}
+
+function Complete-DeliveryOptimizationTroubleshooterTrace {
+    param(
+        [Parameter(Mandatory)]$TraceProcess,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [datetime]$EndedAt = (Get-Date),
+        [ValidateRange(1, 120000)][int]$CompletionTimeoutMilliseconds = 120000
+    )
+
+    $process = $TraceProcess.Process
+    $completed = $false
+    $loggingDisabled = $false
+    try {
+        $process.StandardInput.WriteLine()
+        $process.StandardInput.Close()
+        if (-not $process.WaitForExit($CompletionTimeoutMilliseconds)) {
+            throw 'DO troubleshooter did not finish before the stop timeout.'
+        }
+
+        $stdout = $TraceProcess.OutputTask.Result
+        $loggingDisabled = $stdout -match 'Verbose logging disabled successfully\.'
+        $stderr = $TraceProcess.ErrorTask.Result.Trim()
+        if ($process.ExitCode -ne 0) {
+            throw "DO troubleshooter exited with code $($process.ExitCode). $stderr"
+        }
+        if ($stderr) { Write-CLog "DO troubleshooter warnings: $stderr" -Level WARN }
+
+        $bundles = @(Get-ChildItem -LiteralPath $TraceProcess.WorkingDirectory -Filter 'dosvc-diag-*.zip' -File)
+        if ($bundles.Count -ne 1) {
+            throw 'The DO troubleshooter did not create exactly one support bundle in its private temporary directory.'
+        }
+
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($bundles[0].FullName)
+        try {
+            $entry = $archive.Entries | Where-Object { $_.FullName -eq 'logs-dosvc-repro.txt' } |
+                Select-Object -First 1
+            if (-not $entry) { throw 'The DO support bundle does not contain logs-dosvc-repro.txt.' }
+            Ensure-Dir (Split-Path -Path $DestinationPath -Parent)
+            $reader = [System.IO.StreamReader]::new($entry.Open())
+            try {
+                $writer = [System.IO.StreamWriter]::new($DestinationPath, $false, [System.Text.UTF8Encoding]::new($true))
+                try {
+                    $entryCount = Convert-DeliveryOptimizationReproductionTrace -Reader $reader -Writer $writer `
+                        -StartUtc $TraceProcess.StartedAt.ToUniversalTime() -EndUtc $EndedAt.ToUniversalTime()
+                } finally {
+                    $writer.Dispose()
+                }
+            } finally {
+                $reader.Dispose()
+            }
+            if ($entryCount -eq 0) { throw 'The DO reproduction trace has no events in the reproduction window.' }
+        } finally {
+            $archive.Dispose()
+        }
+
+        Write-CLog ("Captured {0} verbose DO reproduction events ({1:N2} MB)" -f $entryCount, ((Get-Item -LiteralPath $DestinationPath).Length / 1MB)) -Level OK
+        $completed = $true
+        return $true
+    } finally {
+        if (-not $process.HasExited) {
+            $process.Kill()
+            $null = $process.WaitForExit(5000)
+        }
+        if (-not $loggingDisabled) {
+            try { Disable-DeliveryOptimizationVerboseLogs -Force -ErrorAction Stop | Out-Null }
+            catch { Write-CLog "DO verbose logging cleanup failed: $($_.Exception.Message)" -Level ERROR }
+        }
+        if (-not $completed) {
+            Remove-Item -LiteralPath $DestinationPath -Force -ErrorAction SilentlyContinue
+        }
+        $process.Dispose()
+        Remove-Item -LiteralPath $TraceProcess.WorkingDirectory -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
 
 function Test-IsAdmin {
     ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
@@ -1875,6 +2232,18 @@ Invoke-Safe 'baseline: user session context (JSON)' {
 
 #region Start Traces
 
+$script:DOToolTempDir = Join-Path $env:TEMP ("TraceIntuneAppDeploy_DO_{0}" -f [guid]::NewGuid().ToString('N'))
+$script:DOTroubleshooter = $null
+if ($NoDeliveryOptimizationTrace) {
+    Write-CLog 'Delivery Optimization verbose trace disabled by -NoDeliveryOptimizationTrace.' -Level SKIP
+} else {
+    $script:DOTroubleshooter = Resolve-DeliveryOptimizationTroubleshooter `
+        -PreferredPath $DeliveryOptimizationTroubleshooterPath `
+        -DownloadDirectory $script:DOToolTempDir
+}
+$script:DOTraceProcess  = $null
+$script:DOTraceCaptured = $false
+
 $script:TraceStartedAt = Get-Date
 $script:NetTraceRunning = $false
 $script:NetTraceEtl     = Join-Path $netDir ("NetTrace_{0}.etl" -f $script:Timestamp)
@@ -2076,6 +2445,21 @@ if (Test-Path -LiteralPath $script:IMEMainLog) {
 
 $deadline = $script:TraceStartedAt.AddMinutes($MaxMinutes)
 
+try {
+if ($script:DOTroubleshooter) {
+    try {
+        Write-CLog 'Starting Microsoft DO troubleshooter verbose reproduction trace...'
+        $script:DOTraceProcess = Start-DeliveryOptimizationTroubleshooterTrace `
+            -ScriptPath $script:DOTroubleshooter `
+            -Deadline $deadline `
+            -WorkingDirectory (Join-Path $script:DOToolTempDir 'SupportBundle')
+        Write-CLog 'Verbose Delivery Optimization logging is active.' -Level OK
+    } catch {
+        Write-CLog "Verbose DO trace unavailable: $($_.Exception.Message)" -Level WARN
+        $script:DOTraceProcess = $null
+    }
+}
+
 Write-Host ''
 Write-Host '==============================================================' -ForegroundColor Cyan
 Write-Host '  TRACE ACTIVE                                                ' -ForegroundColor Cyan
@@ -2090,6 +2474,7 @@ Write-Host ('  Packet capture: {0}' -f $(
     else { 'off (ETW only)' }
 ))
 Write-Host ('  Live tail     : {0}' -f $(if ($script:TailReader) {'IntuneManagementExtension.log'} else {'unavailable'}))
+Write-Host ('  DO trace      : {0}' -f $(if ($NoDeliveryOptimizationTrace) {'disabled'} elseif ($script:DOTraceProcess) {'verbose reproduction trace active'} else {'unavailable'}))
 Write-Host ''
 Write-Host '  Steps:' -ForegroundColor Yellow
 Write-Host '    1. Open Company Portal (Store app or https://portal.manage.microsoft.com)'
@@ -2318,7 +2703,24 @@ else {
     }
 }
 
+} finally {
 $script:TraceEndedAt = Get-Date
+if ($script:DOTraceProcess) {
+    $doOut = Get-CmdOutPath -Dir $cmdDir -OutputFileName 'Get-DeliveryOptimizationLog'
+    try {
+        $script:DOTraceCaptured = Complete-DeliveryOptimizationTroubleshooterTrace `
+            -TraceProcess $script:DOTraceProcess `
+            -DestinationPath $doOut `
+            -EndedAt $script:TraceEndedAt
+    } catch {
+        Write-CLog "Unable to finalize verbose DO trace: $($_.Exception.Message)" -Level WARN
+    }
+}
+if ($script:DOToolTempDir -and (Test-Path -LiteralPath $script:DOToolTempDir)) {
+    Remove-Item -LiteralPath $script:DOToolTempDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+}
+
 Write-Host ''
 
 #endregion
@@ -2888,105 +3290,16 @@ Invoke-Safe 'Company Portal logs (all user profiles, full copy)' {
     Write-CLog ("       CP files copied: {0} across {1} user profile(s)" -f $totalFiles, $userCount)
 }
 
-# v1.2.0: Delivery Optimization logs via Get-DeliveryOptimizationLog. The cmdlet
-# reads the DO ETLs and returns structured text; we filter to the trace window.
-# This is the primary artifact for diagnosing content-download problems during
-# Win32 + Store deployments.
-Invoke-Safe 'Delivery Optimization log (trace window)' {
-    # v1.2.2: user-specified ODC convention:
-    # %COMPUTERNAME%_Get-DeliveryOptimizationLog.txt under Intune\Commands\General
+Invoke-Safe 'Delivery Optimization verbose reproduction trace' {
     $doOut = Get-CmdOutPath -Dir $cmdDir -OutputFileName 'Get-DeliveryOptimizationLog'
-    try {
-        # Get-DeliveryOptimizationLog emits objects with a TimeCreated property
-        # whose values are stored as UTC but reported with DateTimeKind=Unspecified -
-        # so the same comparison must happen against UTC trace bounds. v1.3.0-1.3.5
-        # used local-time bounds, which silently dropped every entry on non-UTC hosts.
-        # v1.3.6: (a) widens the pad to 120s, (b) on empty result, dumps the full log
-        # unfiltered (matches ODC behavior - the trace window is still documented in
-        # _Summary.txt for cross-correlation).
-        $padSec  = 120
-        $winStartUtc = $script:TraceStartedAt.ToUniversalTime().AddSeconds(-$padSec)
-        $winEndUtc   = $script:TraceEndedAt.ToUniversalTime().AddSeconds($padSec)
-        $allDo = Get-DeliveryOptimizationLog -ErrorAction Stop
-        $doEntries = $allDo | Where-Object {
-            $tc = if ($_.TimeCreated.Kind -eq [System.DateTimeKind]::Local) {
-                      $_.TimeCreated.ToUniversalTime()
-                  } else {
-                      # Unspecified or Utc - treat as UTC (matches DO log convention)
-                      [System.DateTime]::SpecifyKind($_.TimeCreated, [System.DateTimeKind]::Utc)
-                  }
-            $tc -ge $winStartUtc -and $tc -le $winEndUtc
-        }
-        $useFull = $false
-        if (-not $doEntries) {
-            # Fallback: full log (matches ODC). Better to over-collect than to lose data.
-            $doEntries = $allDo
-            $useFull = $true
-        }
-        if ($doEntries) {
-            # v1.3.6: emit Format-List style blocks (key : value, blank line between
-            # records). This matches the layout downstream analyzers (Store /
-            # Win32) parse with `split on blank line` + `Key: Value` regexes.
-            # The previous flat pipe-separated format was unparseable, leading to
-            # "No Delivery Optimization jobs in this log" even when the file was
-            # multi-MB. TimeCreated is normalized to ISO-8601 UTC so JS
-            # `new Date()` parses it deterministically regardless of host culture.
-            $doEntries |
-                Select-Object `
-                    @{n='TimeCreated';e={
-                        $tc = if ($_.TimeCreated.Kind -eq [System.DateTimeKind]::Local) {
-                                  $_.TimeCreated.ToUniversalTime()
-                              } else {
-                                  [System.DateTime]::SpecifyKind($_.TimeCreated, [System.DateTimeKind]::Utc)
-                              }
-                        $tc.ToString("yyyy-MM-ddTHH:mm:ss.fffK")
-                    }},
-                    @{n='LevelName';e={ if ($_.LevelName) { $_.LevelName } else { switch ($_.Level) { 1 {'Critical'} 2 {'Error'} 3 {'Warning'} 4 {'Information'} 5 {'Verbose'} default {"Level$($_.Level)"} } } }},
-                    @{n='ProcessId';e={ $_.ProcessId }},
-                    @{n='ThreadId';e={ $_.ThreadId }},
-                    @{n='Function';e={ $_.Function }},
-                    @{n='ErrorCode';e={ $_.ErrorCode }},
-                    @{n='LineNumber';e={ $_.LineNumber }},
-                    @{n='Message';e={ $_.Message }} |
-                Format-List |
-                Out-File -FilePath $doOut -Encoding UTF8 -Width 4096
-            if ($useFull) {
-                Write-CLog ("       no entries in window; captured full log ({0} entries)" -f $doEntries.Count) -Level WARN
-            } else {
-                Write-CLog ("       captured {0} DO log entries" -f $doEntries.Count)
-            }
-        } else {
-            'Get-DeliveryOptimizationLog returned no entries.' | Out-File -FilePath $doOut -Encoding UTF8
-            Write-CLog '       Get-DeliveryOptimizationLog returned no entries' -Level WARN
-        }
-    } catch {
-        "Get-DeliveryOptimizationLog unavailable: $($_.Exception.Message)" |
-            Out-File -FilePath $doOut -Encoding UTF8
-    }
-    # v1.3.0: Raw DO ETLs. These are the authoritative source for
-    # content-download attribution (CDN hostname, content ID, peer bytes,
-    # caller identity StoreInstaller vs WinGet) - Get-DeliveryOptimizationLog
-    # emits a textual RE-RENDER of these ETLs, so when troubleshooting
-    # caller-identity questions the text is insufficient.
-    # Active ETL files are always safe to copy open; do not stop dosvc
-    # (stopping the service loses in-flight peer connections).
-    # Previously filtered by LastWriteTime >= trace start; that missed files
-    # whose active-session write-through hadn't hit disk yet during a short
-    # window. Now: copy ALL *.etl files in the DO Logs dir. Size stays
-    # reasonable (<50 MB typical) because DO rotates its own files.
-    $doEtlSrc = [Environment]::ExpandEnvironmentVariables('%WinDir%\ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Logs')
-    if (Test-Path -LiteralPath $doEtlSrc) {
-        $doEtlDst = Join-Path $script:FilesIntune 'DeliveryOptimization_ETL'
-        Ensure-Dir $doEtlDst
-        $etlCount = 0
-        Get-ChildItem -LiteralPath $doEtlSrc -Filter '*.etl' -File -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                Copy-Item -LiteralPath $_.FullName -Destination $doEtlDst -Force -ErrorAction SilentlyContinue
-                $etlCount++
-            }
-        Write-CLog ("       copied {0} DO ETL file(s) from {1}" -f $etlCount, $doEtlSrc)
+    if ($script:DOTraceCaptured -and (Test-Path -LiteralPath $doOut)) {
+        Write-CLog '       captured only the verbose DO reproduction trace'
+    } elseif ($NoDeliveryOptimizationTrace) {
+        Write-CLog '       verbose DO trace disabled by -NoDeliveryOptimizationTrace' -Level SKIP
     } else {
-        Write-CLog ("       DO ETL path not present: {0}" -f $doEtlSrc) -Level SKIP
+        'Verbose Delivery Optimization reproduction trace unavailable.' |
+            Out-File -FilePath $doOut -Encoding UTF8
+        Write-CLog '       verbose DO reproduction trace unavailable' -Level WARN
     }
 }
 
@@ -3977,6 +4290,7 @@ Invoke-Safe 'write _Summary.txt' {
     $lines += "User              : $env:USERDOMAIN\$env:USERNAME"
     $lines += "MaxMinutes        : $MaxMinutes"
     $lines += "NetworkTrace      : $(-not $NoNetworkTrace)"
+    $lines += "DO verbose trace  : $script:DOTraceCaptured"
     if (-not $NoNetworkTrace) {
         $lines += "  packet mode     : $script:PacketMode$(if ($script:PacketMode -eq 'Headers') { " (pktmon, ${PacketBytes}-byte frames)" })"
         $lines += "  extra providers : $script:NetTraceProviders"
