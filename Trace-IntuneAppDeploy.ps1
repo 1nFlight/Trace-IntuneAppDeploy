@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Live trace collector for Intune Company Portal Win32 / MSIX / LOB app deployments.
+    Live trace collector for Intune Win32 / MSIX / native MSI / Office Suite deployments.
 
 .DESCRIPTION
     Companion to Collect-IntuneLogs.ps1. Whereas that tool captures a *snapshot*
@@ -44,8 +44,28 @@
     verbose reproduction output, Get-WindowsUpdateLog output, and raw WU ETLs -
     each filtered to the trace window.
 
+    Native MSI uses EnterpriseDesktopAppManagement; Office Suite uses Office CSP
+    and ODT / Click-to-Run, independently of IME. A separate 128 MB circular ETW
+    session captures desktop-app CSP WPP, Office CSP TraceLogging, MDM diagnostics
+    and BITS. Baseline/end-state registry exports include OfficeCSP and both
+    Click-to-Run views. Surviving MSI and Office logs are selected by file times
+    from SYSTEM and user profiles; their full contents are retained unchanged.
+    Office verbose logging is not enabled or modified. Start reproduction only
+    after TRACE ACTIVE, using Company Portal or an MDM sync for an assigned app.
+
+    Optional -CaptureMsiWpr records system-wide CPU/waits, file I/O and registry
+    activity with WPR for analysis of msiexec.exe (including service instances
+    and custom-action processes) in WPA. The ETL is saved under Trace\MsiWpr.etl.
+
+    Windows Temp files and subfolders are inventoried before tracing. Surviving
+    files created during the trace window are copied to Intune\Files\WindowsTemp,
+    preserving relative paths. Existing files updated during tracing are excluded.
+
 .PARAMETER OutputRoot
     Folder where the final ZIP is written. Default: current user's Desktop.
+    If Desktop is unavailable, uses %TEMP%\IntuneAppDeployTraces with a warning.
+    Explicit paths must be nonempty filesystem directories. Relative paths are
+    resolved against the current PowerShell location. Validated before tracing.
 
 .PARAMETER MaxMinutes
     Safety timeout. Trace auto-stops at this mark even if [ENTER] was not
@@ -57,6 +77,22 @@
     endpoint probe). Use on environments where network capture is restricted
     by policy, or where a separate tool (Wireshark / pktmon) is already
     capturing.
+
+    Does not disable the native MDM ETW session or the DO troubleshooter.
+
+.PARAMETER NoNativeMdmTrace
+    Skip the separate native MSI / Office CSP ETW session. Registry snapshots,
+    installer logs and event log exports are still collected. This session is
+    independent of -NoNetworkTrace and uses a 128 MB circular ETL.
+
+.PARAMETER CaptureMsiWpr
+    Opt in to WPR GeneralProfile + FileIO + Registry capture for msiexec analysis.
+    Records system-wide activity, not only msiexec.exe. Filter by process in WPA.
+    Starts before TRACE ACTIVE; Enter/timeout saves Trace\MsiWpr.etl, Q discards.
+    Uses a unique WPR instance and cleans up on interruption. Requires wpr.exe.
+    Independent of the network, native MDM and DO capture switches.
+    File-mode recording can grow large; keep the reproduction window short.
+    -NetTraceMaxSizeMB does not limit this ETL. MSI logging settings are unchanged.
 
 .PARAMETER PacketCapture
     How raw frames are captured. Default: Headers.
@@ -120,6 +156,10 @@
     .\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace
 
 .EXAMPLE
+    # WPR capture for MSI performance / hangs, without network or DO capture
+    .\Trace-IntuneAppDeploy.ps1 -CaptureMsiWpr -NoNetworkTrace -NoDeliveryOptimizationTrace
+
+.EXAMPLE
     # Full frames instead of headers (plain-HTTP CDN / DO payload analysis)
     .\Trace-IntuneAppDeploy.ps1 -PacketCapture Full -NetTraceMaxSizeMB 4096
 
@@ -138,6 +178,26 @@
     aborts with a clear error if one is already active.
 
     Changelog:
+        1.8.0  2026-10-06  Recursively capture newly created Windows Temp files,
+                           excluding pre-existing files and collector staging;
+                           retain source paths and copy failures in a CSV index.
+                           Fix empty Desktop defaults with a TEMP fallback and
+                           early writable-directory validation. Preserve staging
+                           on ZIP failure, including partially written archives.
+
+        1.7.0  2026-10-06  Added opt-in -CaptureMsiWpr: GeneralProfile, FileIO and
+                           Registry WPR capture for msiexec analysis in WPA;
+                           uniquely owned instance, finally stop/cancel,
+                           ETL validation, summary and regression tests.
+
+        1.6.0  2026-09-16  Native MSI and Office Suite deployment capture:
+                           separate bounded CSP / MDM / BITS ETW session with
+                           explicit runtime-provider GUIDs and finally cleanup;
+                           OfficeCSP / Click-to-Run registry snapshots; surviving
+                           SYSTEM and per-user installer logs with source index.
+                           Native capture does not require IME or network trace.
+                           Added -NoNativeMdmTrace and isolated regression tests.
+
         1.5.0  2026-09-14  Delivery Optimization collection now uses the
                    official DeliveryOptimizationTroubleshooter
                            support-bundle reproduction workflow. The collector
@@ -998,6 +1058,10 @@ param(
 
     [switch]$NoNetworkTrace,
 
+    [switch]$NoNativeMdmTrace,
+
+    [switch]$CaptureMsiWpr,
+
     # v1.4.0: frame-capture strategy. See .PARAMETER PacketCapture.
     [ValidateSet('Headers', 'Full', 'Off')]
     [string]$PacketCapture = 'Headers',
@@ -1044,14 +1108,14 @@ param(
 
 #region Constants
 
-$APP_VERSION = '1.5.0'
-$APP_BUILD   = '2026-09-14'
+$APP_VERSION = '1.8.0'
+$APP_BUILD   = '2026-10-06'
 
 $script:Timestamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $script:Computer  = $env:COMPUTERNAME
 $script:StageRoot = Join-Path $env:TEMP ("AppDeployTrace_{0}_{1}" -f $script:Computer, $script:Timestamp)
 $script:ZipName   = "{0}_AppDeployTrace_{1}.zip" -f $script:Computer, $script:Timestamp
-$script:ZipPath   = Join-Path $OutputRoot $script:ZipName
+$script:ZipPath   = $null
 $script:LogFile   = Join-Path $script:StageRoot '_Collector.log'
 $script:Summary   = Join-Path $script:StageRoot '_Summary.txt'
 $script:Report    = Join-Path $script:StageRoot '_AppDeployReport.txt'
@@ -1103,6 +1167,59 @@ function Invoke-Safe {
 }
 
 function Ensure-Dir { param([string]$Path) if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Path $Path -Force | Out-Null } }
+
+function Resolve-TraceOutputRoot {
+    [CmdletBinding()]
+    param(
+        [string]$Path,
+        [switch]$Explicit
+    )
+
+    $usedFallback = $false
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        if ($Explicit) { throw '-OutputRoot must be a nonempty filesystem directory.' }
+        if ([string]::IsNullOrWhiteSpace($env:TEMP)) {
+            throw 'Desktop and TEMP are unavailable. Specify -OutputRoot with a writable filesystem directory.'
+        }
+        $Path = Join-Path $env:TEMP 'IntuneAppDeployTraces'
+        $usedFallback = $true
+    }
+
+    try {
+        $provider = $null
+        $drive = $null
+        $resolvedPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath(
+            $Path, [ref]$provider, [ref]$drive
+        )
+        if ($provider.Name -ne 'FileSystem') { throw 'The output path must use the FileSystem provider.' }
+        if (Test-Path -LiteralPath $resolvedPath -ErrorAction Stop) {
+            if (-not (Get-Item -LiteralPath $resolvedPath -Force -ErrorAction Stop).PSIsContainer) {
+                throw 'The output path is an existing file, not a directory.'
+            }
+        } else {
+            $null = [IO.Directory]::CreateDirectory($resolvedPath)
+        }
+
+        $probePath = Join-Path $resolvedPath ('.AppDeployTrace_write_test_' + [guid]::NewGuid().ToString('N') + '.tmp')
+        $probeStream = $null
+        try {
+            $probeStream = [IO.FileStream]::new(
+                $probePath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+                [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose
+            )
+            $probeStream.WriteByte(0)
+        } finally {
+            if ($probeStream) { $probeStream.Dispose() }
+        }
+    } catch {
+        throw "Cannot use OutputRoot '$Path': $($_.Exception.Message)"
+    }
+
+    if ($usedFallback) {
+        Write-Warning "Desktop is unavailable for this execution context. ZIP output will use '$resolvedPath'. Override with -OutputRoot if needed."
+    }
+    return $resolvedPath
+}
 
 function Test-DeliveryOptimizationTroubleshooterTrust {
     param([Parameter(Mandatory)][string]$Path)
@@ -1446,6 +1563,221 @@ function Export-RegKey {
     $null = & reg.exe export $keyPath "$out" /y 2>$null
 }
 
+function Export-NativeMdmAppRegistry {
+    param([Parameter(Mandatory)][string]$OutDir)
+
+    foreach ($key in @(
+        'HKLM\SOFTWARE\Microsoft\EnterpriseDesktopAppManagement'
+        'HKLM\SOFTWARE\Microsoft\OfficeCSP'
+        'HKLM\SOFTWARE\Microsoft\Office\ClickToRun'
+        'HKLM\SOFTWARE\WOW6432Node\Microsoft\Office\ClickToRun'
+    )) {
+        Export-RegKey -Key $key -OutDir $OutDir
+    }
+}
+
+function Get-NativeMdmLogSources {
+    param([string]$ComputerName = $env:COMPUTERNAME)
+
+    $profileRoots = @(
+        (Join-Path $env:SystemRoot 'System32\config\systemprofile')
+        (Join-Path $env:SystemRoot 'SysWOW64\config\systemprofile')
+        $env:USERPROFILE
+    )
+    try {
+        $profileRoots += @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop |
+            Select-Object -ExpandProperty LocalPath)
+    } catch {
+        Write-CLog "Unable to enumerate user profiles for native MDM logs: $($_.Exception.Message)" -Level WARN
+    }
+    $localRoots = @($env:LOCALAPPDATA)
+    $localRoots += @($profileRoots | Where-Object { $_ } | ForEach-Object { Join-Path $_ 'AppData\Local' })
+    $localRoots = @($localRoots | Where-Object { $_ } | Sort-Object -Unique)
+    foreach ($localRoot in $localRoots) {
+        [pscustomobject]@{ Kind = 'MSI'; Path = (Join-Path $localRoot 'mdm'); Filters = @('*.log') }
+    }
+
+    $tempRoots = @($env:TEMP, (Join-Path $env:SystemRoot 'Temp'))
+    $tempRoots += @($localRoots | ForEach-Object { Join-Path $_ 'Temp' })
+    foreach ($tempRoot in ($tempRoots | Where-Object { $_ } | Sort-Object -Unique)) {
+        [pscustomobject]@{
+            Kind = 'Office'
+            Path = $tempRoot
+            Filters = @("$ComputerName*.log", 'officeclicktorun*.log')
+        }
+    }
+}
+
+function Copy-NativeMdmAppLogs {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Sources,
+        [Parameter(Mandatory)][string]$OutDir,
+        [Parameter(Mandatory)][datetime]$StartUtc,
+        [Parameter(Mandatory)][datetime]$EndUtc
+    )
+
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $collected = [System.Collections.Generic.List[object]]::new()
+    $sourceIndex = 0
+    foreach ($source in $Sources) {
+        $sourceIndex++
+        if (-not (Test-Path -LiteralPath $source.Path -PathType Container)) { continue }
+        foreach ($filter in $source.Filters) {
+            $candidates = Get-ChildItem -LiteralPath $source.Path -Filter $filter -File -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Extension -eq '.log' -and $_.CreationTimeUtc -le $EndUtc -and $_.LastWriteTimeUtc -ge $StartUtc -and
+                    -not ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)
+                }
+            foreach ($file in $candidates) {
+                if (-not $seen.Add($file.FullName)) { continue }
+                $relativePath = Join-Path $source.Kind ('Source_{0:D3}\{1}' -f $sourceIndex, $file.Name)
+                $destinationPath = Join-Path $OutDir $relativePath
+                try {
+                    Ensure-Dir (Split-Path -Path $destinationPath -Parent)
+                    Copy-Item -LiteralPath $file.FullName -Destination $destinationPath -Force -ErrorAction Stop
+                    $collected.Add([pscustomobject]@{
+                        Kind = $source.Kind
+                        SourcePath = $file.FullName
+                        CollectedPath = $relativePath
+                        CreationTimeUtc = $file.CreationTimeUtc.ToString('o')
+                        LastWriteTimeUtc = $file.LastWriteTimeUtc.ToString('o')
+                        CollectedBytes = (Get-Item -LiteralPath $destinationPath).Length
+                    })
+                } catch {
+                    Write-CLog "Unable to copy native deployment log $($file.FullName): $($_.Exception.Message)" -Level WARN
+                }
+            }
+        }
+    }
+    if ($collected.Count -gt 0) {
+        $collected | Export-Csv -LiteralPath (Join-Path $OutDir 'CollectedFiles.csv') -NoTypeInformation -Encoding UTF8
+    }
+    return $collected.Count
+}
+
+function Get-WindowsTempInventory {
+    param(
+        [Parameter(Mandatory)][string]$SourceRoot,
+        [string[]]$ExcludedPaths = @()
+    )
+
+    $root = Get-Item -LiteralPath $SourceRoot -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw "Windows Temp source must be a directory, not a file or reparse point: $SourceRoot"
+    }
+    $rootPrefix = $root.FullName.TrimEnd('\') + '\'
+    $excluded = @($ExcludedPaths | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') })
+    $files = @{}
+    $unreadable = [System.Collections.Generic.List[string]]::new()
+    $pending = [System.Collections.Generic.Stack[string]]::new()
+    $pending.Push($root.FullName)
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            $entries = @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop)
+        } catch {
+            $unreadable.Add($directory)
+            Write-CLog "Unable to inventory Windows Temp directory '$directory': $($_.Exception.Message). This subtree will be excluded." -Level WARN
+            continue
+        }
+        foreach ($entry in $entries) {
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            $isExcluded = $false
+            foreach ($path in $excluded) {
+                if ($entry.FullName.Equals($path, [StringComparison]::OrdinalIgnoreCase) -or
+                    $entry.FullName.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    $isExcluded = $true
+                    break
+                }
+            }
+            if ($isExcluded) { continue }
+            if ($entry.PSIsContainer) {
+                $pending.Push($entry.FullName)
+            } else {
+                $files[$entry.FullName] = [pscustomobject]@{
+                    SourcePath = $entry.FullName
+                    RelativePath = $entry.FullName.Substring($rootPrefix.Length)
+                    CreationTimeUtc = $entry.CreationTimeUtc
+                    LastWriteTimeUtc = $entry.LastWriteTimeUtc
+                }
+            }
+        }
+    }
+    return [pscustomobject]@{
+        SourceRoot = $root.FullName
+        Files = $files
+        ExcludedPaths = $excluded
+        UnreadableDirectories = $unreadable.ToArray()
+    }
+}
+
+function Copy-NewWindowsTempFiles {
+    param(
+        [Parameter(Mandatory)][object]$Baseline,
+        [Parameter(Mandatory)][string]$OutDir,
+        [Parameter(Mandatory)][datetime]$StartUtc,
+        [Parameter(Mandatory)][datetime]$EndUtc
+    )
+
+    if ($EndUtc -lt $StartUtc) { throw 'Windows Temp collection end must not precede its start.' }
+    $exclusions = @($Baseline.ExcludedPaths) + @($Baseline.UnreadableDirectories) + @($OutDir)
+    $current = Get-WindowsTempInventory -SourceRoot $Baseline.SourceRoot -ExcludedPaths $exclusions
+    $records = [System.Collections.Generic.List[object]]::new()
+    $copied = 0
+    $failed = 0
+    $bytes = [long]0
+    $null = [IO.Directory]::CreateDirectory($OutDir)
+    foreach ($file in ($current.Files.Values | Sort-Object SourcePath)) {
+        if ($file.CreationTimeUtc -lt $StartUtc -or $file.CreationTimeUtc -gt $EndUtc) { continue }
+        if ($Baseline.Files.ContainsKey($file.SourcePath) -and
+            $Baseline.Files[$file.SourcePath].CreationTimeUtc -eq $file.CreationTimeUtc) { continue }
+
+        $relativePath = Join-Path 'Files' $file.RelativePath
+        $destination = Join-Path $OutDir $relativePath
+        $record = [pscustomobject]@{
+            SourcePath = $file.SourcePath
+            CollectedPath = $relativePath
+            CreationTimeUtc = $file.CreationTimeUtc.ToString('o')
+            LastWriteTimeUtc = $file.LastWriteTimeUtc.ToString('o')
+            CollectedBytes = 0
+            Status = 'Failed'
+            Error = ''
+        }
+        try {
+            $source = Get-Item -LiteralPath $file.SourcePath -Force -ErrorAction Stop
+            if ($source.PSIsContainer -or ($source.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                $source.CreationTimeUtc -ne $file.CreationTimeUtc) {
+                throw 'Source changed after inventory; not copying a replacement or reparse point.'
+            }
+            $null = [IO.Directory]::CreateDirectory((Split-Path -Path $destination -Parent))
+            Copy-Item -LiteralPath $file.SourcePath -Destination $destination -Force -ErrorAction Stop
+            $record.CollectedBytes = (Get-Item -LiteralPath $destination -Force -ErrorAction Stop).Length
+            $record.Status = 'Copied'
+            $copied++
+            $bytes += $record.CollectedBytes
+        } catch {
+            $failed++
+            $record.Error = $_.Exception.Message
+            if (Test-Path -LiteralPath $destination -PathType Leaf) {
+                Remove-Item -LiteralPath $destination -Force -ErrorAction Stop
+            }
+            Write-CLog "Unable to copy new Windows Temp file '$($file.SourcePath)': $($record.Error)" -Level WARN
+        }
+        $records.Add($record)
+    }
+    $manifestPath = Join-Path $OutDir 'CollectedFiles.csv'
+    if ($records.Count -gt 0) {
+        $records | Export-Csv -LiteralPath $manifestPath -NoTypeInformation -Encoding UTF8 -ErrorAction Stop
+    }
+    return [pscustomobject]@{
+        SourceRoot = $Baseline.SourceRoot
+        CopiedCount = $copied
+        FailedCount = $failed
+        CollectedBytes = $bytes
+        UnreadableDirectoryCount = @(@($Baseline.UnreadableDirectories) + @($current.UnreadableDirectories) | Sort-Object -Unique).Count
+    }
+}
+
 function New-EventLogExport {
     <#
         Exports a channel filtered to a time window (UTC).
@@ -1520,6 +1852,156 @@ function Resolve-EtwProvider {
     $k = $Name.ToLowerInvariant()
     if ($script:EtwProviderCache.ContainsKey($k)) { return $script:EtwProviderCache[$k] }
     return $null
+}
+
+function Start-NativeMdmAppTrace {
+    param([Parameter(Mandatory)][string]$OutDir)
+
+    Ensure-Dir $OutDir
+    $providers = [ordered]@{
+        'EnterpriseDesktopAppManagement (WPP)' = '{ef614386-f019-4323-85a1-d6ebaf9cde12}'
+        'Microsoft.Office.Deployment.OfficeCsp' = '{f01756f1-23c4-5663-6e27-5cb7e7942ad2}'
+    }
+    foreach ($name in @(
+        'Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider'
+        'Microsoft-Windows-Bits-Client'
+    )) {
+        $providerGuid = Resolve-EtwProvider -Name $name
+        if ($providerGuid) {
+            $providers[$name] = $providerGuid
+        } else {
+            Write-CLog "Native MDM provider unavailable: $name" -Level SKIP
+        }
+    }
+
+    $providerFile = Join-Path $OutDir 'NativeMdmProviders.txt'
+    $providers.Values | ForEach-Object { "$_ 0xffffffffffffffff 5" } |
+        Set-Content -LiteralPath $providerFile -Encoding ASCII
+    foreach ($provider in $providers.GetEnumerator()) {
+        Write-CLog ("Native MDM provider: {0} {1}" -f $provider.Key, $provider.Value)
+    }
+
+    $sessionName = 'IntuneNativeMdm_{0}_{1}' -f $PID, [guid]::NewGuid().ToString('N')
+    $etlPath = Join-Path $OutDir 'NativeMdm.etl'
+    $startArguments = @(
+        'create', 'trace', $sessionName, '-o', $etlPath, '-ow',
+        '-f', 'bincirc', '-max', '128', '-pf', $providerFile, '-ets'
+    )
+    $started = $false
+    try {
+        $output = & logman.exe @startArguments 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "Native MDM ETW start failed: $($output -join ' | ')"
+        }
+        $started = $true
+        return [pscustomobject]@{
+            SessionName = $sessionName
+            EtlPath = $etlPath
+            ProviderCount = $providers.Count
+            Running = $true
+        }
+    } finally {
+        if (-not $started) {
+            try { $null = & logman.exe stop $sessionName -ets 2>&1 } catch { }
+        }
+    }
+}
+
+function Stop-NativeMdmAppTrace {
+    param([Parameter(Mandatory)]$TraceSession)
+
+    if (-not $TraceSession.Running) { return }
+    $output = & logman.exe stop $TraceSession.SessionName -ets 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Native MDM ETW stop failed: {0}. Stop manually with: logman stop {1} -ets" -f
+            ($output -join ' | '), $TraceSession.SessionName)
+    }
+    $TraceSession.Running = $false
+}
+
+function Start-MsiWprTrace {
+    param([Parameter(Mandatory)][string]$OutDir)
+
+    $ErrorActionPreference = 'Stop'
+    $wpr = Get-Command wpr.exe -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $wpr) {
+        throw 'MSI WPR capture requires wpr.exe. Install the Windows Performance Toolkit or run without -CaptureMsiWpr.'
+    }
+
+    Ensure-Dir $OutDir
+    $traceSession = [pscustomobject]@{
+        InstanceName = 'IntuneMsiWpr_{0}_{1}' -f $PID, [guid]::NewGuid().ToString('N')
+        WprPath = $wpr.Source
+        EtlPath = Join-Path $OutDir 'MsiWpr.etl'
+        Profiles = @('GeneralProfile', 'FileIO', 'Registry')
+        Running = $false
+        Captured = $false
+    }
+    $startArguments = @()
+    foreach ($profile in $traceSession.Profiles) {
+        $startArguments += '-start', $profile
+    }
+    # WPR requires -instancename to be last on every session command.
+    $startArguments += '-filemode', '-instancename', $traceSession.InstanceName
+    try {
+        $output = & $traceSession.WprPath @startArguments 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw ("exit {0}: {1}" -f $LASTEXITCODE, ($output -join ' | '))
+        }
+        $traceSession.Running = $true
+        return $traceSession
+    } catch {
+        $startFailure = $_.Exception.Message
+        try {
+            $output = & $traceSession.WprPath -cancel -instancename $traceSession.InstanceName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw ("exit {0}: {1}" -f $LASTEXITCODE, ($output -join ' | '))
+            }
+        } catch {
+            Write-CLog ("MSI WPR failed-start cleanup: {0}. If the instance is still active, cancel only it with: & `"{1}`" -cancel -instancename {2}" -f
+                $_.Exception.Message, $traceSession.WprPath, $traceSession.InstanceName) -Level WARN
+        }
+        throw "MSI WPR start failed: $startFailure. Other WPR instances were not stopped."
+    }
+}
+
+function Stop-MsiWprTrace {
+    param(
+        [Parameter(Mandatory)]$TraceSession,
+        [switch]$Discard
+    )
+
+    if (-not $TraceSession.Running) { return }
+    $ErrorActionPreference = 'Stop'
+    $operation = if ($Discard) { 'cancel' } else { 'stop' }
+    [string[]]$stopArguments = if ($Discard) {
+        @('-cancel')
+    } else {
+        @('-stop', $TraceSession.EtlPath, 'Intune app deployment (msiexec.exe)', '-skipPdbGen', '-compress')
+    }
+    $stopArguments += '-instancename', $TraceSession.InstanceName
+    try {
+        $output = & $TraceSession.WprPath @stopArguments 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw ("exit {0}: {1}" -f $LASTEXITCODE, ($output -join ' | '))
+        }
+    } catch {
+        throw ("MSI WPR {0} failed: {1}. Recover only this instance with: & `"{2}`" -stop `"{3}`" -instancename {4}; or discard with: & `"{2}`" -cancel -instancename {4}" -f
+            $operation, $_.Exception.Message, $TraceSession.WprPath, $TraceSession.EtlPath, $TraceSession.InstanceName)
+    }
+    $TraceSession.Running = $false
+    if ($Discard) {
+        Write-CLog 'MSI WPR recording discarded.' -Level OK
+        return
+    }
+    if (-not (Test-Path -LiteralPath $TraceSession.EtlPath -PathType Leaf) -or
+        (Get-Item -LiteralPath $TraceSession.EtlPath).Length -eq 0) {
+        throw "MSI WPR stopped but did not save a nonempty ETL: $($TraceSession.EtlPath)"
+    }
+    $TraceSession.Captured = $true
+    Write-CLog ("MSI WPR saved: {0}. Open in WPA and filter by msiexec.exe and its custom-action processes." -f
+        $TraceSession.EtlPath) -Level OK
 }
 
 function Invoke-CaptureCmd {
@@ -1915,14 +2397,8 @@ if ($Host.Name -eq 'Windows PowerShell ISE Host') {
     }
 }
 
-# Ensure output path exists
-if (-not (Test-Path -LiteralPath $OutputRoot)) {
-    try { New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null }
-    catch {
-        Write-Host "ERROR: Cannot create OutputRoot '$OutputRoot'." -ForegroundColor Red
-        return
-    }
-}
+$OutputRoot = Resolve-TraceOutputRoot -Path $OutputRoot -Explicit:($PSBoundParameters.ContainsKey('OutputRoot'))
+$script:ZipPath = Join-Path $OutputRoot $script:ZipName
 
 # Check for existing netsh trace session
 if (-not $NoNetworkTrace) {
@@ -2051,7 +2527,7 @@ if (Test-Path -LiteralPath $script:IMELogsPath) {
         }
     Write-CLog ("Baseline: recorded positions for {0} IME log file(s)" -f $script:BaselinePositions.Count)
 } else {
-    Write-CLog "Baseline: IME log path not found  -  device may not be Intune-enrolled" -Level WARN
+    Write-CLog "Baseline: IME log path not found  -  native MSI / Office MDM collection remains available" -Level SKIP
 }
 
 # Installed apps inventory at baseline
@@ -2098,14 +2574,14 @@ Invoke-Safe 'baseline: AppX/MSIX inventory' {
 }
 
 # Baseline IME registry state (key target of Win32 app tracking)
-Invoke-Safe 'baseline: registry (IME + EnterpriseDesktopAppManagement)' {
+Invoke-Safe 'baseline: registry (IME + native MDM apps)' {
     # v1.2.6: mirror to Intune\RegistryKeys\ too. Analyzers scan that path for
     # EDAM / IME registry exports; keeping a copy in Baseline\ preserves the
     # pre-trace context for diffing.
     Export-RegKey -Key 'HKLM\SOFTWARE\Microsoft\IntuneManagementExtension'    -OutDir $baseDir
-    Export-RegKey -Key 'HKLM\SOFTWARE\Microsoft\EnterpriseDesktopAppManagement' -OutDir $baseDir
+    Export-NativeMdmAppRegistry -OutDir $baseDir
     Export-RegKey -Key 'HKLM\SOFTWARE\Microsoft\IntuneManagementExtension'    -OutDir $regDir
-    Export-RegKey -Key 'HKLM\SOFTWARE\Microsoft\EnterpriseDesktopAppManagement' -OutDir $regDir
+    Export-NativeMdmAppRegistry -OutDir $regDir
 }
 
 # v1.3.0: User session context. Store-app install scope (User vs Machine) and
@@ -2244,6 +2720,14 @@ if ($NoDeliveryOptimizationTrace) {
 $script:DOTraceProcess  = $null
 $script:DOTraceCaptured = $false
 
+$script:WindowsTempBaseline = $null
+$script:WindowsTempCollection = $null
+Invoke-Safe 'baseline: Windows Temp files' {
+    $script:WindowsTempBaseline = Get-WindowsTempInventory -SourceRoot (Join-Path $env:SystemRoot 'Temp') `
+        -ExcludedPaths @($script:StageRoot, $script:DOToolTempDir, $script:ZipPath)
+    Write-CLog ("Windows Temp baseline: {0} file(s), {1} unreadable subtree(s); only new files will be collected." -f `
+        $script:WindowsTempBaseline.Files.Count, $script:WindowsTempBaseline.UnreadableDirectories.Count)
+}
 $script:TraceStartedAt = Get-Date
 $script:NetTraceRunning = $false
 $script:NetTraceEtl     = Join-Path $netDir ("NetTrace_{0}.etl" -f $script:Timestamp)
@@ -2436,7 +2920,7 @@ if (Test-Path -LiteralPath $script:IMEMainLog) {
         Write-CLog "Failed to open tail on IME log: $($_.Exception.Message)" -Level WARN
     }
 } else {
-    Write-CLog "IntuneManagementExtension.log not found  -  live tail disabled" -Level WARN
+    Write-CLog "IME log not found  -  console tail disabled; native MSI / Office capture is independent" -Level SKIP
 }
 
 #endregion
@@ -2444,8 +2928,22 @@ if (Test-Path -LiteralPath $script:IMEMainLog) {
 #region Interactive Pause with Live Tail
 
 $deadline = $script:TraceStartedAt.AddMinutes($MaxMinutes)
+$script:NativeMdmTrace = $null
+$script:NativeMdmLogCount = 0
+$script:MsiWprTrace = $null
 
 try {
+if (-not $NoNativeMdmTrace) {
+    Invoke-Safe 'start native MSI / Office MDM trace' {
+        $script:NativeMdmTrace = Start-NativeMdmAppTrace -OutDir $trcDir
+    }
+}
+if ($CaptureMsiWpr) {
+    Invoke-Safe 'start MSI WPR trace' {
+        $script:MsiWprTrace = Start-MsiWprTrace -OutDir $trcDir
+        Write-CLog 'MSI WPR active (system-wide CPU/waits, file I/O and registry). Keep the reproduction short; file-mode ETLs are not size-capped.' -Level WARN
+    }
+}
 if ($script:DOTroubleshooter) {
     try {
         Write-CLog 'Starting Microsoft DO troubleshooter verbose reproduction trace...'
@@ -2474,11 +2972,14 @@ Write-Host ('  Packet capture: {0}' -f $(
     else { 'off (ETW only)' }
 ))
 Write-Host ('  Live tail     : {0}' -f $(if ($script:TailReader) {'IntuneManagementExtension.log'} else {'unavailable'}))
+Write-Host ('  Native MDM    : {0}' -f $(if ($NoNativeMdmTrace) {'disabled'} elseif ($script:NativeMdmTrace) {'MSI / Office CSP ETW active'} else {'unavailable'}))
+Write-Host ('  MSI WPR       : {0}' -f $(if (-not $CaptureMsiWpr) {'disabled (opt-in)'} elseif ($script:MsiWprTrace) {'active; filter msiexec.exe in WPA'} else {'unavailable; see _Collector.log'}))
 Write-Host ('  DO trace      : {0}' -f $(if ($NoDeliveryOptimizationTrace) {'disabled'} elseif ($script:DOTraceProcess) {'verbose reproduction trace active'} else {'unavailable'}))
+Write-Host ('  Windows Temp  : {0}' -f $(if ($script:WindowsTempBaseline) {'new files only, including subfolders'} else {'unavailable; see _Collector.log'}))
 Write-Host ''
 Write-Host '  Steps:' -ForegroundColor Yellow
-Write-Host '    1. Open Company Portal (Store app or https://portal.manage.microsoft.com)'
-Write-Host '    2. Install the target application'
+Write-Host '    1. Open Company Portal, or Access work or school > account > Info'
+Write-Host '    2. Install the target app, or Sync to receive its required MDM deployment'
 Write-Host '    3. Wait for the install to complete (success or failure)'
 Write-Host '    4. Press [ENTER] here to stop the trace and collect logs'
 Write-Host ''
@@ -2705,6 +3206,36 @@ else {
 
 } finally {
 $script:TraceEndedAt = Get-Date
+if ($script:MsiWprTrace) {
+    Invoke-Safe 'stop MSI WPR trace' {
+        Stop-MsiWprTrace -TraceSession $script:MsiWprTrace -Discard:$userAborted
+    }
+}
+if ($script:NativeMdmTrace) {
+    Invoke-Safe 'stop native MSI / Office MDM trace' {
+        Stop-NativeMdmAppTrace -TraceSession $script:NativeMdmTrace
+    }
+}
+if (-not $userAborted) {
+    if ($script:WindowsTempBaseline) {
+        Invoke-Safe 'new Windows Temp files' {
+            $script:WindowsTempCollection = Copy-NewWindowsTempFiles -Baseline $script:WindowsTempBaseline `
+                -OutDir (Join-Path $script:IntuneRoot 'Files\WindowsTemp') `
+                -StartUtc $script:TraceStartedAt.ToUniversalTime() -EndUtc $script:TraceEndedAt.ToUniversalTime()
+            Write-CLog ("Windows Temp: {0} new file(s) copied, {1} copy failure(s), {2} unreadable subtree(s)." -f `
+                $script:WindowsTempCollection.CopiedCount, $script:WindowsTempCollection.FailedCount, `
+                $script:WindowsTempCollection.UnreadableDirectoryCount)
+        }
+    } else {
+        Write-CLog 'Windows Temp collection unavailable: no baseline inventory. Existing files will not be collected as a fallback.' -Level WARN
+    }
+    Invoke-Safe 'native MSI / Office installer logs' {
+        $script:NativeMdmLogCount = Copy-NativeMdmAppLogs -Sources @(Get-NativeMdmLogSources) `
+            -OutDir (Join-Path $script:IntuneRoot 'Files\NativeMdm') `
+            -StartUtc $script:TraceStartedAt.ToUniversalTime() -EndUtc $script:TraceEndedAt.ToUniversalTime()
+        Write-CLog ("Native deployment logs collected: {0} (surviving files; MSI may delete successful-install logs)" -f $script:NativeMdmLogCount)
+    }
+}
 if ($script:DOTraceProcess) {
     $doOut = Get-CmdOutPath -Dir $cmdDir -OutputFileName 'Get-DeliveryOptimizationLog'
     try {
@@ -3340,7 +3871,6 @@ Invoke-Safe 'Windows Update log (trace window)' {
 Invoke-Safe 'registry (end-state IME + app mgmt)' {
     $regKeys = @(
         'HKLM\SOFTWARE\Microsoft\IntuneManagementExtension',
-        'HKLM\SOFTWARE\Microsoft\EnterpriseDesktopAppManagement',
         'HKLM\SOFTWARE\Microsoft\EnterpriseModernAppManagement',
         'HKLM\SOFTWARE\Microsoft\PolicyManager\current\device\EnterpriseModernAppManagement',
         'HKLM\SOFTWARE\Microsoft\Provisioning\NodeCache\CSP',
@@ -3348,6 +3878,7 @@ Invoke-Safe 'registry (end-state IME + app mgmt)' {
         'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
     )
     foreach ($k in $regKeys) { Export-RegKey -Key $k -OutDir $regDir }
+    Export-NativeMdmAppRegistry -OutDir $regDir
 }
 
 # --- End-state installed apps ---
@@ -4291,6 +4822,37 @@ Invoke-Safe 'write _Summary.txt' {
     $lines += "MaxMinutes        : $MaxMinutes"
     $lines += "NetworkTrace      : $(-not $NoNetworkTrace)"
     $lines += "DO verbose trace  : $script:DOTraceCaptured"
+    $lines += "Native MDM trace  : $(if ($NoNativeMdmTrace) {'disabled'} elseif (-not $script:NativeMdmTrace) {'unavailable'} elseif ($script:NativeMdmTrace.Running) {'stop failed; ETL may be incomplete'} else {'stopped'})"
+    $lines += "Native MDM logs   : $script:NativeMdmLogCount (surviving files; full contents, not line-filtered)"
+    if ($script:WindowsTempCollection) {
+        $lines += "Windows Temp      : $($script:WindowsTempCollection.CopiedCount) new file(s), $($script:WindowsTempCollection.FailedCount) copy failure(s), $($script:WindowsTempCollection.UnreadableDirectoryCount) unreadable subtree(s)"
+        $lines += "  Temp source     : $($script:WindowsTempCollection.SourceRoot) (recursive; pre-existing files excluded)"
+        $lines += "  Temp bytes      : $($script:WindowsTempCollection.CollectedBytes)"
+    } else {
+        $lines += 'Windows Temp      : unavailable; see _Collector.log'
+    }
+    $lines += "MSI WPR trace     : $(if (-not $CaptureMsiWpr) {'disabled'} elseif (-not $script:MsiWprTrace) {'unavailable; see _Collector.log'} elseif ($script:MsiWprTrace.Running) {'stop failed; recording may still be active'} elseif ($script:MsiWprTrace.Captured) {'captured'} else {'save failed; ETL unavailable or incomplete'})"
+    if ($script:MsiWprTrace) {
+        $lines += "  WPR instance    : $($script:MsiWprTrace.InstanceName)"
+        $lines += "  WPR profiles    : $($script:MsiWprTrace.Profiles -join ', ') (file mode; no size cap)"
+        $lines += "  WPR etl         : $($script:MsiWprTrace.EtlPath)"
+        $lines += '  WPR scope       : system-wide; filter msiexec.exe and custom-action processes in WPA'
+        if (Test-Path -LiteralPath $script:MsiWprTrace.EtlPath -PathType Leaf) {
+            $lines += "  WPR etl size    : {0:N2} MB" -f ((Get-Item -LiteralPath $script:MsiWprTrace.EtlPath).Length / 1MB)
+        }
+    }
+    if ($script:NativeMdmTrace) {
+        $lines += "  native session  : $($script:NativeMdmTrace.SessionName)"
+        $lines += "  native etl      : $($script:NativeMdmTrace.EtlPath)"
+        $lines += "  native providers: $($script:NativeMdmTrace.ProviderCount)"
+        if (Test-Path -LiteralPath $script:NativeMdmTrace.EtlPath) {
+            $nativeEtlSize = (Get-Item -LiteralPath $script:NativeMdmTrace.EtlPath).Length / 1MB
+            $lines += "  native etl size : {0:N2} MB (128 MB circular cap)" -f $nativeEtlSize
+            if ($nativeEtlSize -ge (128 * 0.98)) {
+                $lines += '  !! Native MDM ETL is near its cap; early events may have been overwritten.'
+            }
+        }
+    }
     if (-not $NoNetworkTrace) {
         $lines += "  packet mode     : $script:PacketMode$(if ($script:PacketMode -eq 'Headers') { " (pktmon, ${PacketBytes}-byte frames)" })"
         $lines += "  extra providers : $script:NetTraceProviders"
@@ -4349,9 +4911,9 @@ Invoke-Safe 'write _Summary.txt' {
 
 #region Compress
 
-Invoke-Safe 'compress to ZIP' {
+$zipCreated = Invoke-Safe 'compress to ZIP' {
     if (Test-Path -LiteralPath $script:ZipPath) {
-        Remove-Item -LiteralPath $script:ZipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $script:ZipPath -Force -ErrorAction Stop
     }
     Add-Type -AssemblyName System.IO.Compression.FileSystem
     [System.IO.Compression.ZipFile]::CreateFromDirectory(
@@ -4362,7 +4924,7 @@ Invoke-Safe 'compress to ZIP' {
     )
 }
 
-if (Test-Path -LiteralPath $script:ZipPath) {
+if ($zipCreated -and (Test-Path -LiteralPath $script:ZipPath -PathType Leaf)) {
     $zipSize = (Get-Item -LiteralPath $script:ZipPath).Length
     # Clean stage (ZIP is the deliverable)
     Remove-Item -LiteralPath $script:StageRoot -Recurse -Force -ErrorAction SilentlyContinue

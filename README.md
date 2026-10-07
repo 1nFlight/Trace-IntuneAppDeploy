@@ -1,10 +1,16 @@
 # Trace-IntuneAppDeploy
 
-Live trace collector for **Intune Company Portal** Win32 / MSIX / LOB app deployments on Windows.
+Live trace collector for **Intune** Win32 / MSIX / native MSI / Office Suite app deployments on Windows, triggered through Company Portal or MDM sync.
 
 Where the Microsoft OneDataCollector (ODC) and similar tools capture an *after-the-fact snapshot*, this script captures a **trace across a known user-initiated deployment window** — baseline, network capture, live IME log tail, time-bounded event logs, content-distribution stack (WinGet / DO / WU), and a delta of installed apps — packaged into an ODC-compatible ZIP that opens cleanly in the **Win32 Analyzer** and **Store Analyzer** HTML viewers.
 
 As of **v1.4.x** the network capture is two legs — a tuned ETW trace plus a header-only packet capture converted to `.pcapng` — alongside a proxy/DNS/DO stack snapshot and a TLS-interception probe of every Store, WinGet, Delivery-Optimization, Windows-Update and Intune endpoint. See [Network capture](#network-capture).
+
+**v1.6.0** adds a separate native MDM ETW session, MSI/Office installer logs, and Office CSP/Click-to-Run registry snapshots. These do not depend on IME being installed. See [Native MSI and Office Suite](#native-msi-and-office-suite).
+
+**v1.7.0** adds opt-in `-CaptureMsiWpr` for Windows Performance Recorder capture during MSI reproduction. See [MSI WPR capture](#msi-wpr-capture).
+
+**v1.8.0** captures newly created Windows Temp files recursively and fixes empty Desktop output paths, including SYSTEM/noninteractive runs. See [Windows Temp files](#windows-temp-files).
 
 ---
 
@@ -28,6 +34,7 @@ As of **v1.4.x** the network capture is two legs — a tuned ETW trace plus a he
 - No other `netsh trace` or `pktmon` session active (the script aborts with a clear error if one is).
 - `pktmon.exe` for the default header-only packet capture. Absent on older builds — the script falls back to `-PacketCapture Full` automatically.
 - Access to PowerShell Gallery, or a trusted local `DeliveryOptimizationTroubleshooter.ps1` supplied with `-DeliveryOptimizationTroubleshooterPath`. Not required with `-NoDeliveryOptimizationTrace`.
+- `wpr.exe` when using `-CaptureMsiWpr` (in-box on supported Windows builds, or installed with the Windows Performance Toolkit). WPA is needed only for analysis.
 
 ---
 
@@ -58,9 +65,11 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `-OutputRoot` | Current user's Desktop | Folder where the final ZIP is written. |
+| `-OutputRoot` | Current user's Desktop; `%TEMP%\IntuneAppDeployTraces` if Desktop is unavailable | Folder where the final ZIP is written. Created and checked for write access before tracing. Explicit empty/invalid paths fail rather than silently falling back; relative paths use the current PowerShell location. |
 | `-MaxMinutes` | `15` (range 1–240) | Safety timeout. Trace auto-stops at this mark even if `[ENTER]` was not pressed. |
 | `-NoNetworkTrace` | *(off)* | Skip the whole network capture — ETW leg, packet leg, stack snapshot and endpoint probe. Use where capture is policy-restricted, or when Wireshark / pktmon is already running. |
+| `-NoNativeMdmTrace` | *(off)* | Skip the separate 128 MB native MSI / Office CSP ETW session. Registry, installer logs and event exports are still collected. Independent of `-NoNetworkTrace` and `-NoDeliveryOptimizationTrace`. |
+| `-CaptureMsiWpr` | *(off)* | Add system-wide WPR CPU/waits, file I/O and registry capture for `msiexec.exe` analysis in WPA. Saves `Trace\MsiWpr.etl`. Independent of the other capture switches; file mode has no size cap. |
 | `-PacketCapture` | `Headers` | `Headers` = pktmon, every frame truncated to `-PacketBytes`. `Full` = netsh `capture=yes`, full frames, no pktmon. `Off` = ETW + snapshot + probe only. |
 | `-PacketBytes` | `768` (range 64–65535) | Per-frame truncation for `Headers` mode. See [Network capture](#network-capture) for why 768. |
 | `-NetTraceMaxSizeMB` | `1024` (range 64–8192) | Max size cap for the netsh ETL and the pktmon ETL (each, circular). |
@@ -100,6 +109,15 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
 
 # Leave DO logging/service state untouched by the troubleshooter
 .\Trace-IntuneAppDeploy.ps1 -NoDeliveryOptimizationTrace
+
+# Native MSI / Office CSP trace without network capture or DO restarts
+.\Trace-IntuneAppDeploy.ps1 -NoNetworkTrace -NoDeliveryOptimizationTrace
+
+# Add WPR for MSI performance / hangs (including IME-deployed MSI installers)
+.\Trace-IntuneAppDeploy.ps1 -CaptureMsiWpr -MaxMinutes 5
+
+# WPR only among the active capture workflows; snapshots/log collection still run
+.\Trace-IntuneAppDeploy.ps1 -CaptureMsiWpr -NoNetworkTrace -NoNativeMdmTrace -NoDeliveryOptimizationTrace
 ```
 
 ---
@@ -120,18 +138,21 @@ With parameters — use `[scriptblock]::Create` so `param()` accepts them:
     │   ├── PktMon_<timestamp>.pcapng     ← converted — open in Wireshark / the analyzers
     │   ├── Diagnostics\                  ← network stack snapshot (pre + post) + endpoint probe
     │   └── ManualHAR\                    ← drop-folder for operator-captured Edge HAR
-    ├── Trace\                           ← live-tail capture, delta extracts
+    ├── Trace\                           ← live-tail capture, deltas, NativeMdm.etl + provider list
+    │   └── MsiWpr.etl                   ← optional WPR capture; open in WPA
     └── Intune\
         ├── Commands\
         │   └── General\                 ← includes the verbose DO reproduction trace
         ├── Files\
         │   ├── Sidecar\                 ← full IME log copy
         │   ├── General\                 ← WinGet_<user>, misc
+        │   ├── NativeMdm\               ← MSI\, Office\, CollectedFiles.csv
+        │   ├── WindowsTemp\             ← Files\<original relative path>, CollectedFiles.csv
         │   ├── WPM\                     ← WPM-*.txt
         │   └── Intune\
         │       └── WindowsUpdate_ETL\
         ├── EventLogs\                   ← .evtx, time-filtered to trace window
-        └── RegistryKeys\                ← .reg exports of Win32 app state keys
+        └── RegistryKeys\                ← .reg exports of IME, MSI, OfficeCSP and Click-to-Run state
 ```
 
 The `Intune\` subtree matches the legacy Microsoft OneDataCollector layout, so the same ZIP opens cleanly in the **Win32 Analyzer** (`Tools/Win32/`) and **Store Analyzer** (`Tools/Store Apps/`) viewers. `Baseline\`, `Network\`, and `Trace\` are trace-only artifacts that the analyzers don't need to classify.
@@ -146,6 +167,59 @@ The deployment window is recorded as `TraceStartedAt` to `TraceEndedAt`. Event e
 - **Installed apps diff** — two sections: *Win32 / MSI / EXE* (registry-based) and *Store / MSIX / Appx* (`Get-AppxPackage -AllUsers`, with added / removed / upgraded).
 - **Event channels** — IME, AppxDeployment, DeviceManagement-Enterprise-Diagnostics-Provider, BITS, Store, AAD, DeliveryOptimization (Operational + Analytic), WindowsUpdateClient, WUSA. Filtered server-side via `wevtutil epl /q:<XPath>`.
 - **Content distribution** — WinGet per-user `DiagOutputDir` (walks all user profiles), WPM-*.txt, the `logs-dosvc-repro.txt` verbose trace produced by `DeliveryOptimizationTroubleshooter.ps1 -GenerateSupportBundle -ReproduceIssueWithVerboseLogs`, `Get-WindowsUpdateLog`, and raw WU ETLs. Only the DO reproduction trace is retained; the troubleshooter's other support-bundle files and temporary ZIP are removed.
+
+---
+
+## Native MSI and Office Suite
+
+These are MDM deployments, not IME Win32 installations:
+
+| Deployment | Windows path | Collected evidence |
+|---|---|---|
+| Native MSI / Windows LOB | `./Device` or `./User/Vendor/MSFT/EnterpriseDesktopAppManagement/MSI/{ProductCode}/DownloadInstall`, then Windows Installer | Desktop-app CSP WPP trace, MDM diagnostics, Application events including MsiInstaller, EnterpriseDesktopAppManagement registry, surviving per-job MSI logs. |
+| Microsoft 365 Apps / Office Suite | `./Vendor/MSFT/Office/Installation/{id}/Install`, then Office CSP / ofdeploy / ODT / Click-to-Run | Office CSP TraceLogging including ODT exit status, BITS bootstrap trace, OfficeCSP and Click-to-Run registry, surviving Office installation logs. |
+
+The Office CSP downloads ODT through BITS. The later Office payload download is a separate Click-to-Run stage; DO evidence alone does not cover the bootstrap. The existing packet trace captures actual traffic, but its fixed endpoint probes remain Store/WinGet/DO/WU/Intune-oriented and are not an Office CDN or MSI-content reachability test.
+
+**ETW:** The collector starts a uniquely named, nonpersistent `logman -ets` session immediately before reproduction. It enables desktop-app WPP `{ef614386-f019-4323-85a1-d6ebaf9cde12}` and `Microsoft.Office.Deployment.OfficeCsp` `{f01756f1-23c4-5663-6e27-5cb7e7942ad2}` directly: runtime-only providers need not appear in `logman query providers` before the CSP starts. DMEDP and BITS are added when registered. The 128 MB circular ETL and provider list are retained under `Trace\`; raw WPP decoding requires matching symbols/TMFs. Starting a session does not prove every provider emitted events. Cleanup runs on Enter, timeout, Q and interruption; stop failures are logged with the session-specific recovery command.
+
+**State:** Baseline and final registry exports include `HKLM\SOFTWARE\Microsoft\EnterpriseDesktopAppManagement`, `OfficeCSP`, and native/WOW6432Node `Office\ClickToRun`. OfficeCSP contains configuration XML and per-install status; Click-to-Run supplies the state Windows uses to build `CurrentStatus`. Raw values are preserved: Office `Status=997` is pending, `Status=0` is success, and `FinalStatus=70` is success (`60` is failure). These are different status scales.
+
+**Installer logs:** MSI logs are collected from `AppData\Local\mdm\*.log` in SYSTEM's native/32-bit profile and known user profiles. Office logs are collected from Windows and user temp folders using `<ComputerName>*.log` and `officeclicktorun*.log`. Only top-level matching logs that existed by trace stop and were updated since trace start are copied. Active files may include later writes; full file contents are retained, not line-filtered. Numbered source folders avoid filename collisions, and `Intune\Files\NativeMdm\CollectedFiles.csv` records original paths, timestamps and copied sizes. No downloaded MSI, ODT executable or Office payload is copied.
+
+MSI normally adds verbose per-job logging, but Windows can delete those logs after accepted installer results, including a retryable `1618`. Missing logs do not prove logging was disabled or installation failed. Custom MSI log locations are not discovered. Office verbose logging settings are left unchanged; enable verbose Office logging before reproduction when needed using the [Microsoft 365 Apps troubleshooting guidance](https://learn.microsoft.com/intune/app-management/deployment/add-microsoft-365-windows#troubleshooting).
+
+Wait for **TRACE ACTIVE**, then install from Company Portal or select **Sync** under **Access work or school > account > Info** for a required deployment. Use `-NoNativeMdmTrace` to opt out of native ETW. To suppress all three active capture workflows, also use `-NoNetworkTrace -NoDeliveryOptimizationTrace`; registry/log/event snapshots still run. Native evidence does not populate the existing IME-specific per-app correlation report. Treat the ZIP as sensitive: it can contain deployment XML, identifiers, command lines and content URLs.
+
+Public CSP references: [EnterpriseDesktopAppManagement](https://learn.microsoft.com/windows/client-management/mdm/enterprisedesktopappmanagement-csp) and [Office](https://learn.microsoft.com/windows/client-management/mdm/office-csp).
+
+---
+
+## Windows Temp files
+
+The collector inventories `%SystemRoot%\Temp` (normally `C:\Windows\Temp`) and its subfolders before tracing, then copies surviving files created between `TraceStartedAt` and `TraceEndedAt`. This runs by default, independently of WPR, native MDM, network and DO capture switches. Reproduce only after **TRACE ACTIVE**.
+
+Both the baseline inventory and UTC creation timestamps are checked. Existing files are excluded even if modified during capture; a replacement at the same path is eligible when its creation timestamp changes within the window. Files created after stop or backdated before start are excluded. Relative paths are preserved under `Intune\Files\WindowsTemp\Files\`, so duplicate filenames in different folders do not collide.
+
+This collection includes **all file types**, not just `MSI*.log`. Collector staging, the collector's temporary DO bundle, the target ZIP and reparse points/junctions are excluded. Subfolders that could not be inventoried at baseline are excluded rather than treating their existing files as new. If the whole baseline is unavailable, this collection is skipped with a warning; it never falls back to copying the entire temp folder.
+
+`CollectedFiles.csv` records original/collected paths, UTC timestamps, copied sizes and copy failures. `_Collector.log` and `_Summary.txt` report copied files, copy failures and unreadable subfolders. Locked or deleted files cannot be recovered; this is an end-of-window copy, not a continuous file backup. New files still being written are copied with their current contents, not line-filtered. Q skips copying, as it does other reproduction artifacts.
+
+**Size and privacy:** No size cap is applied. Newly created temporary payloads and files from unrelated processes can increase the ZIP size and may contain sensitive data. Review the ZIP before sharing. This supplements the separately scoped native MSI/Office logs; it does not enable MSI verbose logging or change installer behavior.
+
+---
+
+## MSI WPR capture
+
+Use `-CaptureMsiWpr` for MSI slowness or hangs, whether the installer was launched by IME, native MDM or manually. WPR starts before **TRACE ACTIVE** using the built-in `GeneralProfile`, `FileIO` and `Registry` profiles in file mode. It captures CPU samples/stacks, scheduling/waits, disk/file I/O and registry activity. It does not launch or attach to an installer, enable heap tracing, change MSI logging settings, or replace verbose MSI logs.
+
+The recording is **system-wide**, not process-filtered at collection time. This includes `msiexec.exe` instances that start later, service-side installers and custom-action host processes. Open `Trace\MsiWpr.etl` from the ZIP in **Windows Performance Analyzer (WPA)**, select the relevant installation interval, and filter CPU Usage, File I/O and Registry tables to the appropriate `msiexec.exe` PIDs. Use process lifetimes/tree information to identify related custom-action processes; do not assume all simultaneous MSI instances belong to the target install.
+
+Enter or the safety timeout saves the ETL; Q cancels it without saving. Cleanup also runs on interruption. Every start/stop/cancel command uses a unique `-instancename`; the collector never cancels another WPR recording. Missing WPR, profile/session conflicts, and save failures are logged explicitly while the other collections continue. Stop failures include an instance-specific recovery command in `_Collector.log`. `_Summary.txt` records capture status, profiles, instance, ETL path and size.
+
+**Overhead and privacy:** These verbose profiles can add overhead and produce large files. Keep the reproduction window short and ensure free space on the system/temp and output drives. `-MaxMinutes` limits the recording window, but `-NetTraceMaxSizeMB` does **not** cap WPR; file-mode recording is limited by available disk space. The ETL can include unrelated processes, command lines, paths and registry activity. Treat the ZIP as sensitive.
+
+Reference: [WPR command-line options](https://learn.microsoft.com/windows-hardware/test/wpt/wpr-command-line-options).
 
 ---
 
@@ -260,11 +334,40 @@ pwsh -NoProfile -File .\tests\Test-DeliveryOptimizationTraceHelpers.ps1
 
 Add `-CheckGallery` to verify real tool acquisition and trust without executing the downloaded script. Tests cover the readiness/stop handshake, time filtering, output format, Unicode paths/text, unrelated bundle protection, pre-existing trace settings, missing/invalid output, child failure, timeouts, and large redirected output. A live elevated deployment capture is a separate validation step.
 
+Native MSI / Office regression tests use mocked registry and ETW commands plus synthetic log files:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-NativeMdmAppTrace.ps1
+pwsh -NoProfile -File .\tests\Test-NativeMdmAppTrace.ps1
+```
+
+They cover baseline/end-state wiring without IME, runtime-provider GUIDs, circular limits, session cleanup and failures, capture opt-out, SYSTEM/user log sources, timestamp selection, duplicate filenames, byte preservation and payload exclusion. They do not exercise a live MDM deployment or validate emitted ETW events.
+
+MSI WPR regression tests mock WPR commands; they do not start a real recording:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-MsiWprTrace.ps1
+pwsh -NoProfile -File .\tests\Test-MsiWprTrace.ps1
+```
+
+They cover opt-in wiring, independence from other capture switches, named-instance ownership, start/stop/cancel failures, interruption cleanup, ETL validation, paths with spaces/Unicode, summary status and ZIP inclusion. A live elevated reproduction and WPA inspection remain separate validation steps.
+
+Output-folder and Windows Temp tests use isolated fixture directories; they do not run the collector:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-OutputRoot.ps1
+pwsh -NoProfile -File .\tests\Test-OutputRoot.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-WindowsTempCapture.ps1
+pwsh -NoProfile -File .\tests\Test-WindowsTempCapture.ps1
+```
+
+They cover missing Desktop fallback, explicit/relative/provider paths, creation/write failures, early ZIP-path validation, and staging retention after failed compression. Temp tests cover recursive new-file selection, updated existing-file exclusion, timestamp bounds, same-name replacements, stage/DO/reparse-point exclusions, unreadable baseline subtrees, locked-file failures, byte preservation, CSV/summary output and ZIP inclusion.
+
 ---
 
 ## Version
 
-`v1.5.0` (2026-09-14). See the `Changelog` block at the top of the script for the full history.
+`v1.8.0` (2026-10-06). See the `Changelog` block at the top of the script for the full history.
 
 ---
 
